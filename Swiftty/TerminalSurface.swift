@@ -5,6 +5,24 @@ import SwiftUI
 final class SwifttyTerminalView: LocalProcessTerminalView {
     private var configuredMetal = false
 
+    /// Computes the cell height from the terminal font metrics so the host
+    /// can build accurate content-based frame sizes.
+    var cellHeight: CGFloat {
+        let f = font as CTFont
+        let h = ceil((CTFontGetAscent(f) + CTFontGetDescent(f) + CTFontGetLeading(f)) * lineSpacing)
+        return max(h, 1)
+    }
+
+    override init(frame frameRect: NSRect) {
+        _ = TerminalView.swizzleScrollWheel
+        super.init(frame: frameRect)
+    }
+
+    required init?(coder: NSCoder) {
+        _ = TerminalView.swizzleScrollWheel
+        super.init(coder: coder)
+    }
+
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
 
@@ -19,6 +37,24 @@ final class SwifttyTerminalView: LocalProcessTerminalView {
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
         super.mouseDown(with: event)
+    }
+}
+
+extension TerminalView {
+    static let swizzleScrollWheel: Void = {
+        let originalSelector = #selector(scrollWheel(with:))
+        let swizzledSelector = #selector(swizzled_scrollWheel(with:))
+        
+        guard let originalMethod = class_getInstanceMethod(TerminalView.self, originalSelector),
+              let swizzledMethod = class_getInstanceMethod(TerminalView.self, swizzledSelector) else {
+            return
+        }
+        
+        method_exchangeImplementations(originalMethod, swizzledMethod)
+    }()
+    
+    @objc func swizzled_scrollWheel(with event: NSEvent) {
+        self.nextResponder?.scrollWheel(with: event)
     }
 }
 
@@ -61,6 +97,7 @@ struct TerminalSurface: NSViewRepresentable {
         func hostCurrentDirectoryUpdate(source: TerminalView, directory: String?) {}
 
         func processTerminated(source: TerminalView, exitCode: Int32?) {
+            source.feed(text: "\u{001b}[?25l")
             DispatchQueue.main.async {
                 self.parent.onExit?(exitCode)
             }

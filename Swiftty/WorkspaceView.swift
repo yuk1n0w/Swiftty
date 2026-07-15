@@ -1,5 +1,6 @@
 import SwiftUI
 import Combine
+import SwiftTerm
 
 struct GitInfo: Equatable {
     let branch: String
@@ -410,27 +411,30 @@ private struct SessionWorkspaceView: View {
     @ObservedObject var session: TerminalSession
 
     var body: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(spacing: 8) {
-                    ForEach(session.blocks) { block in
-                        CommandBlockView(block: block, session: session)
-                            .id(block.id)
+        GeometryReader { geometry in
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(spacing: 8) {
+                        Spacer()
+                        ForEach(session.blocks) { block in
+                            CommandBlockView(block: block, session: session)
+                                .id(block.id)
+                        }
+                    }
+                    .frame(minHeight: geometry.size.height - 20, alignment: .bottom)
+                    .padding(.top, 16)
+                }
+                .onChange(of: session.blocks) { oldValue, newValue in
+                    if let lastBlock = newValue.last {
+                        withAnimation(.easeOut(duration: 0.2)) {
+                            proxy.scrollTo(lastBlock.id, anchor: .bottom)
+                        }
                     }
                 }
-                .padding(.top, 16)
-                .padding(.bottom, 140)
-            }
-            .onChange(of: session.blocks) { oldValue, newValue in
-                if let lastBlock = newValue.last {
-                    withAnimation(.easeOut(duration: 0.2)) {
+                .onAppear {
+                    if let lastBlock = session.blocks.last {
                         proxy.scrollTo(lastBlock.id, anchor: .bottom)
                     }
-                }
-            }
-            .onAppear {
-                if let lastBlock = session.blocks.last {
-                    proxy.scrollTo(lastBlock.id, anchor: .bottom)
                 }
             }
         }
@@ -447,7 +451,7 @@ private struct TerminalWorkspace: View {
     }
 
     var body: some View {
-        ZStack(alignment: .bottom) {
+        VStack(spacing: 0) {
             ZStack {
                 ForEach(sessions) { session in
                     if selectedID == session.id {
@@ -459,7 +463,7 @@ private struct TerminalWorkspace: View {
             }
             .background(Color.black)
 
-            if let selectedSession {
+            if let selectedSession, !selectedSession.blocks.contains(where: { $0.isRunning }) {
                 CommandInputBar(
                     commandText: $commandText,
                     session: selectedSession
@@ -478,6 +482,8 @@ private struct CommandInputBar: View {
     @Binding var commandText: String
     @ObservedObject var session: TerminalSession
     let submit: () -> Void
+
+    @FocusState private var isFocused: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -507,6 +513,7 @@ private struct CommandInputBar: View {
                         .textFieldStyle(.plain)
                         .font(.system(size: 14, weight: .regular, design: .monospaced))
                         .foregroundStyle(Color.swText)
+                        .focused($isFocused)
                         .onSubmit(submit)
 
                     Button(action: submit) {
@@ -538,13 +545,19 @@ private struct CommandInputBar: View {
             .padding(.top, 8)
             .background(Color.swPanel)
         }
+        .onAppear {
+            isFocused = true
+        }
+        .onChange(of: session.id) { _, _ in
+            isFocused = true
+        }
     }
 }
 
 private struct SmallPromptChip: View {
     let systemName: String?
     let text: String
-    let tint: Color
+    let tint: SwiftUI.Color
 
     var body: some View {
         HStack(spacing: 5) {
@@ -569,7 +582,7 @@ private struct SmallPromptChip: View {
 private struct PromptChip: View {
     let systemName: String?
     let text: String
-    let tint: Color
+    let tint: SwiftUI.Color
 
     var body: some View {
         HStack(spacing: 6) {
@@ -593,6 +606,7 @@ private struct CommandBlockView: View {
     @State private var isHovered = false
     @State private var elapsedDuration: Double = 0.0
     @State private var timer: Timer? = nil
+    @State private var terminalHeight: CGFloat = 2000
     
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -651,7 +665,7 @@ private struct CommandBlockView: View {
             ) { exitCode in
                 session.processTerminated(blockID: block.id, exitCode: exitCode)
             }
-            .frame(minHeight: 80, maxHeight: block.isRunning ? 260 : .infinity)
+            .frame(height: terminalHeight)
             .cornerRadius(4)
         }
         .padding(.horizontal, 20)
@@ -674,6 +688,16 @@ private struct CommandBlockView: View {
                 elapsedDuration = 0.0
                 timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in
                     elapsedDuration = Date().timeIntervalSince(block.startTime)
+                    if let view = block.handle.view {
+                        let computedHeight = computeHeight(for: view)
+                        if computedHeight != terminalHeight {
+                            terminalHeight = computedHeight
+                        }
+                    }
+                }
+            } else {
+                if let view = block.handle.view {
+                    terminalHeight = computeHeight(for: view)
                 }
             }
         }
@@ -683,15 +707,43 @@ private struct CommandBlockView: View {
         .onChange(of: block.isRunning) { oldValue, newValue in
             if !newValue {
                 timer?.invalidate()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                    if let view = block.handle.view {
+                        terminalHeight = computeHeight(for: view)
+                    }
+                }
             }
         }
         .contentShape(Rectangle())
+    }
+
+    private func computeHeight(for view: SwifttyTerminalView) -> CGFloat {
+        let rows = view.terminal.rows
+        let ch = view.cellHeight
+        
+        // Scan from bottom to find last row with visible (non-whitespace) content
+        var lastUsedRow = 0
+        for r in stride(from: rows - 1, through: 0, by: -1) {
+            if let line = view.terminal.getLine(row: r) {
+                let text = line.translateToString(trimRight: true)
+                if !text.isEmpty {
+                    lastUsedRow = r
+                    break
+                }
+            }
+        }
+        
+        // Also consider cursor position — some commands leave the cursor
+        // one row past the last output line
+        let cursorRow = view.terminal.buffer.y
+        let contentRows = max(lastUsedRow + 1, min(cursorRow, lastUsedRow + 2))
+        return max(CGFloat(contentRows) * ch, ch)
     }
 }
 
 private struct StyledTextSegment {
     let text: String
-    var color: Color? = nil
+    var color: SwiftUI.Color? = nil
     var isBold: Bool = false
 }
 
@@ -702,7 +754,7 @@ private func parseANSIText(_ text: String) -> Text {
         segments.append(StyledTextSegment(text: first))
     }
     
-    var currentColor: Color? = nil
+    var currentColor: SwiftUI.Color? = nil
     var isBold = false
     
     for part in parts.dropFirst() {
