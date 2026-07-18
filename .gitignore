@@ -1,0 +1,15 @@
+# SwiftPM and Xcode build products
+.build/
+build/
+DerivedData/
+
+# Local profiling/runtime output
+default.profraw
+
+# The original Terax source tree is reference material, not part of Swiftty
+terax-ai/
+terra-ai/
+
+# macOS/editor noise
+.DS_Store
+.swiftpm/
