@@ -212,13 +212,13 @@ struct CommandBlockView: View {
           session.processTerminated(blockID: block.id, exitCode: exitCode)
         }
         .frame(height: terminalHeight)
-        .cornerRadius(4)
+        .cornerRadius(8)
       }
     }
     .padding(.horizontal, 20)
     .padding(.vertical, 14)
     .background(
-      RoundedRectangle(cornerRadius: 6)
+      RoundedRectangle(cornerRadius: 12)
         .fill(
           isSelected
             ? Color(red: 0.063, green: 0.165, blue: 0.208)
@@ -226,7 +226,7 @@ struct CommandBlockView: View {
         )
     )
     .overlay(
-      RoundedRectangle(cornerRadius: 6)
+      RoundedRectangle(cornerRadius: 12)
         .stroke(
           isSelected ? Color.swBlue.opacity(0.6) : (isHovered ? Color.swLine : Color.clear),
           lineWidth: isSelected ? 1.0 : 0.8

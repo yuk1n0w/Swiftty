@@ -80,7 +80,7 @@ struct CommandInputBar: View {
                   .padding(.vertical, 6)
                   .background(isSelected ? Color.swBlue : Color.clear)
                   .foregroundStyle(isSelected ? Color.white : Color.swText)
-                  .cornerRadius(4)
+                  .cornerRadius(8)
                 }
                 .buttonStyle(.plain)
               }
@@ -89,9 +89,9 @@ struct CommandInputBar: View {
           }
           .frame(maxHeight: 180)
         }
-        .glassEffect(.regular.tint(Color.white.opacity(0.015)), in: .rect(cornerRadius: 8))
+        .glassEffect(.regular.tint(Color.white.opacity(0.015)), in: .rect(cornerRadius: 14))
         .overlay(
-          RoundedRectangle(cornerRadius: 8)
+          RoundedRectangle(cornerRadius: 14)
             .stroke(Color.white.opacity(0.12), lineWidth: 0.8)
         )
         .padding(.horizontal, 20)
@@ -116,7 +116,7 @@ struct CommandInputBar: View {
                   .padding(.horizontal, 8)
                   .padding(.vertical, 3)
                   .background(isSelected ? Color.swRaised.opacity(0.4) : Color.clear)
-                  .cornerRadius(4)
+                  .cornerRadius(8)
               }
               .buttonStyle(.plain)
             }
@@ -152,7 +152,7 @@ struct CommandInputBar: View {
                   .padding(.vertical, 6)
                   .background(isSelected ? Color.swBlue : Color.clear)
                   .foregroundStyle(isSelected ? Color.white : Color.swText)
-                  .cornerRadius(4)
+                  .cornerRadius(8)
                 }
                 .buttonStyle(.plain)
               }
@@ -173,13 +173,13 @@ struct CommandInputBar: View {
                 .padding(.horizontal, 4)
                 .padding(.vertical, 1)
                 .background(Color.swRaised)
-                .cornerRadius(3)
+                .cornerRadius(5)
               Text("↓")
                 .font(.system(size: 9))
                 .padding(.horizontal, 4)
                 .padding(.vertical, 1)
                 .background(Color.swRaised)
-                .cornerRadius(3)
+                .cornerRadius(5)
               Text("to navigate")
                 .foregroundStyle(Color.swDim)
             }
@@ -189,7 +189,7 @@ struct CommandInputBar: View {
                 .padding(.horizontal, 4)
                 .padding(.vertical, 1)
                 .background(Color.swRaised)
-                .cornerRadius(3)
+                .cornerRadius(5)
               Text("to cycle tabs")
                 .foregroundStyle(Color.swDim)
             }
@@ -199,7 +199,7 @@ struct CommandInputBar: View {
                 .padding(.horizontal, 4)
                 .padding(.vertical, 1)
                 .background(Color.swRaised)
-                .cornerRadius(3)
+                .cornerRadius(5)
               Text("to dismiss")
                 .foregroundStyle(Color.swDim)
             }
@@ -209,9 +209,9 @@ struct CommandInputBar: View {
           .padding(.horizontal, 12)
           .padding(.vertical, 6)
         }
-        .glassEffect(.regular.tint(Color.white.opacity(0.015)), in: .rect(cornerRadius: 8))
+        .glassEffect(.regular.tint(Color.white.opacity(0.015)), in: .rect(cornerRadius: 14))
         .overlay(
-          RoundedRectangle(cornerRadius: 8)
+          RoundedRectangle(cornerRadius: 14)
             .stroke(Color.white.opacity(0.12), lineWidth: 0.8)
         )
         .padding(.horizontal, 20)
@@ -331,9 +331,9 @@ struct SmallPromptChip: View {
     .font(.system(size: 11, weight: .medium, design: .monospaced))
     .padding(.horizontal, 8)
     .padding(.vertical, 4.5)
-    .background(Color.swRaised.opacity(0.55), in: RoundedRectangle(cornerRadius: 6))
+    .background(Color.swRaised.opacity(0.55), in: RoundedRectangle(cornerRadius: 10))
     .overlay(
-      RoundedRectangle(cornerRadius: 6)
+      RoundedRectangle(cornerRadius: 10)
         .stroke(Color.swLine, lineWidth: 0.6)
     )
   }
@@ -356,6 +356,6 @@ struct PromptChip: View {
     .font(.system(size: 12, weight: .medium, design: .monospaced))
     .padding(.horizontal, 9)
     .padding(.vertical, 7)
-    .glassEffect(.clear, in: .rect(cornerRadius: 6))
+    .glassEffect(.clear, in: .rect(cornerRadius: 10))
   }
 }
