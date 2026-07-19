@@ -120,8 +120,13 @@ struct AutocompleteTextField: NSViewRepresentable {
         parent.session.isAutocompleteOpen = false
 
         if let textView = textField.currentEditor() as? NSTextView {
+          let savedRange = textView.selectedRange()
           let highlighted = highlight(textField.stringValue)
           textView.textStorage?.setAttributedString(highlighted)
+          let maxLen = highlighted.length
+          let clampedLocation = min(savedRange.location, maxLen)
+          let clampedLength = min(savedRange.length, maxLen - clampedLocation)
+          textView.setSelectedRange(NSRange(location: clampedLocation, length: clampedLength))
         } else {
           textField.attributedStringValue = highlight(textField.stringValue)
         }
