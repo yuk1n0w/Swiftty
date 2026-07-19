@@ -179,7 +179,7 @@ struct AutocompleteTextField: NSViewRepresentable {
           navigateHistory(isForward: false)
           return true
         } else if session.isAutocompleteOpen {
-          handleTabOrNavigation(textField: textField, isForward: true)
+          handleTabOrNavigation(textField: textField, isForward: false)
           return true
         }
       }
@@ -189,7 +189,7 @@ struct AutocompleteTextField: NSViewRepresentable {
           navigateHistory(isForward: true)
           return true
         } else if session.isAutocompleteOpen {
-          handleTabOrNavigation(textField: textField, isForward: false)
+          handleTabOrNavigation(textField: textField, isForward: true)
           return true
         } else {
           // Up Arrow opens history suggestions

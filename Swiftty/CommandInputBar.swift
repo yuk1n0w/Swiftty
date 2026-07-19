@@ -61,7 +61,7 @@ struct CommandInputBar: View {
         VStack(alignment: .leading, spacing: 0) {
           ScrollView {
             VStack(alignment: .leading, spacing: 2) {
-              ForEach(Array(session.autocompleteSuggestions.enumerated()), id: \.element) { idx, suggestion in
+              ForEach(Array(session.autocompleteSuggestions.enumerated().reversed()), id: \.element) { idx, suggestion in
                 let isSelected = session.selectedSuggestionIndex == idx
                 let info = suggestionInfo(for: suggestion)
                 Button(action: {
