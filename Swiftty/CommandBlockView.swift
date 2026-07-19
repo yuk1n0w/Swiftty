@@ -269,19 +269,16 @@ struct CommandBlockView: View {
           }
         }
       } else {
-        if block.isRunning {
+        if block.isRunning, let terminalView = session.persistentTerminalView {
           TerminalSurface(
-            currentDirectory: block.directory,
-            command: block.command,
-            handle: block.handle,
+            terminalView: terminalView,
+            session: session,
             onClick: { handleBlockClick() },
             onSelectionChanged: {
               session.selectedBlockIDs.removeAll()
               session.lastSelectedBlockID = nil
             }
-          ) { exitCode in
-            session.processTerminated(blockID: block.id, exitCode: exitCode)
-          }
+          )
           .frame(height: terminalHeight)
           .cornerRadius(8)
         } else if hasOutput, let staticOutput = block.staticOutput {

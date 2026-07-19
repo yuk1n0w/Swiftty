@@ -92,17 +92,77 @@ final class TerminalSession: ObservableObject, Identifiable {
   @Published var historySuggestions: [String] = []
   @Published var isHistoryOpen: Bool = false
   @Published var selectedHistoryIndex: Int? = nil
+  @Published var pendingCommand: String? = nil
   
   @Published var isFieldFocused: Bool = true
   @Published var activeBlockID: UUID? = nil
   
   var persistentTerminalView: SwifttyTerminalView?
   private var commandStartLine: Int = 0
-  private var outputCheckTimer: Timer? = nil
 
   func clearAllTextSelections() {
     for block in blocks {
       block.handle.view?.selectNone()
+    }
+  }
+
+  private static func writeBootstrapFiles(for sessionId: UUID) -> String? {
+    let tempDir = FileManager.default.temporaryDirectory
+      .appendingPathComponent("Swiftty-Session-\(sessionId.uuidString)")
+    
+    do {
+      try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+      
+      let origZdotdir = ProcessInfo.processInfo.environment["ZDOTDIR"] ?? NSHomeDirectory()
+      
+      let zshenvContent = """
+      export SWIFFTY_ORIG_ZDOTDIR="\(origZdotdir)"
+      if [[ -f "$SWIFFTY_ORIG_ZDOTDIR/.zshenv" ]]; then
+        source "$SWIFFTY_ORIG_ZDOTDIR/.zshenv"
+      fi
+      """
+      
+      let zshrcContent = """
+      if [[ -f "$SWIFFTY_ORIG_ZDOTDIR/.zshrc" ]]; then
+        source "$SWIFFTY_ORIG_ZDOTDIR/.zshrc"
+      fi
+      
+      swiftty_hex_encode() {
+        builtin printf "%s" "$1" | command od -An -v -tx1 | command tr -d ' \\n'
+      }
+      
+      swiftty_precmd() {
+        local exit_code=$?
+        local pwd_escaped
+        pwd_escaped=$(pwd)
+        local json="{\\"hook\\":\\"Precmd\\",\\"exit_code\\":$exit_code,\\"pwd\\":\\"$pwd_escaped\\"}"
+        local hex
+        hex=$(swiftty_hex_encode "$json")
+        builtin printf "\\e]0;[Swiftty-JSON-Data:%s]\\a" "$hex"
+      }
+      
+      swiftty_preexec() {
+        local cmd="$1"
+        local cmd_escaped
+        cmd_escaped=$(builtin printf "%s" "$cmd" | command sed 's/\\\\/\\\\\\\\/g; s/\\"/\\\\\\"/g')
+        local json="{\\"hook\\":\\"Preexec\\",\\"command\\":\\"$cmd_escaped\\"}"
+        local hex
+        hex=$(swiftty_hex_encode "$json")
+        builtin printf "\\e]0;[Swiftty-JSON-Data:%s]\\a" "$hex"
+      }
+      
+      autoload -Uz add-zsh-hook
+      add-zsh-hook precmd swiftty_precmd
+      add-zsh-hook preexec swiftty_preexec
+      """
+      
+      try zshenvContent.write(to: tempDir.appendingPathComponent(".zshenv"), atomically: true, encoding: .utf8)
+      try zshrcContent.write(to: tempDir.appendingPathComponent(".zshrc"), atomically: true, encoding: .utf8)
+      
+      return tempDir.path
+    } catch {
+      print("Failed to create bootstrap files: \(error)")
+      return nil
     }
   }
 
@@ -125,16 +185,26 @@ final class TerminalSession: ObservableObject, Identifiable {
     // Set delegate
     view.processDelegate = self
     
-    // Start shell
-    view.startProcess(
-      executable: "/bin/zsh",
-      args: ["-l"],
-      currentDirectory: currentDirectory
-    )
-    
-    // Configure zsh hook to output delimiter
-    view.send(txt: "precmd() { echo -n \"\\n[Swiftty-Command-Done:$?]\\n\" }\n")
-    view.send(txt: "clear\n")
+    let sessionId = self.id
+    if let bootstrapPath = TerminalSession.writeBootstrapFiles(for: sessionId) {
+      view.startProcess(
+        executable: "/usr/bin/env",
+        args: ["ZDOTDIR=" + bootstrapPath, "/bin/zsh", "-l"],
+        currentDirectory: currentDirectory
+      )
+    } else {
+      view.startProcess(
+        executable: "/bin/zsh",
+        args: ["-l"],
+        currentDirectory: currentDirectory
+      )
+    }
+  }
+
+  deinit {
+    let tempDir = FileManager.default.temporaryDirectory
+      .appendingPathComponent("Swiftty-Session-\(self.id.uuidString)")
+    try? FileManager.default.removeItem(at: tempDir)
   }
 
   private static func displayPath(_ path: String) -> String {
@@ -232,29 +302,6 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
   }
 
-  func processTerminated(blockID: UUID, exitCode: Int32?) {
-    guard let idx = self.blocks.firstIndex(where: { $0.id == blockID }) else { return }
-    let block = self.blocks[idx]
-    guard block.isRunning else { return }
-
-    let isError = (exitCode ?? 0) != 0
-    let elapsed = Date().timeIntervalSince(block.startTime)
-
-    self.blocks[idx] = CommandBlock(
-      id: block.id,
-      directory: block.directory,
-      command: block.command,
-      handle: block.handle,
-      startTime: block.startTime,
-      duration: elapsed,
-      gitInfo: self.gitInfo,
-      isRunning: false,
-      isError: isError
-    )
-
-    updateGitInfo()
-  }
-
   func runCommand(_ command: String) {
     let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmed.isEmpty else { return }
@@ -272,23 +319,7 @@ final class TerminalSession: ObservableObject, Identifiable {
       while terminal.getScrollInvariantLine(row: totalLines) != nil {
         totalLines += 1
       }
-      
-      var lastDelimiterLine = -1
-      for r in stride(from: totalLines - 1, through: buffer.totalLinesTrimmed, by: -1) {
-        if let line = terminal.getScrollInvariantLine(row: r) {
-          let text = line.translateToString(trimRight: true)
-          if text.contains("[Swiftty-Command-Done:") {
-            lastDelimiterLine = r
-            break
-          }
-        }
-      }
-      
-      if lastDelimiterLine != -1 {
-        commandStartLine = lastDelimiterLine + 1
-      } else {
-        commandStartLine = totalLines
-      }
+      commandStartLine = totalLines
     } else {
       commandStartLine = 0
     }
@@ -306,60 +337,19 @@ final class TerminalSession: ObservableObject, Identifiable {
       exitCode: nil,
       staticOutput: nil
     )
+    
+    self.pendingCommand = trimmed
     self.blocks.append(runningBlock)
     self.activeBlockID = blockID
     self.isFieldFocused = false
-    
-    // Send command to the shell
-    persistentTerminalView?.send(txt: trimmed + "\n")
     
     // Focus the shell view
     if let view = persistentTerminalView {
       view.window?.makeFirstResponder(view)
     }
-
-    outputCheckTimer?.invalidate()
-    outputCheckTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
-      guard let self = self else { return }
-      Task { @MainActor in
-        self.checkActiveCommandOutput()
-      }
-    }
-  }
-  
-  private func checkActiveCommandOutput() {
-    guard let view = persistentTerminalView, let terminal = view.terminal else { return }
-    let buffer = terminal.buffer
-    let linesTop = buffer.totalLinesTrimmed
-    
-    var totalLines = linesTop
-    while terminal.getScrollInvariantLine(row: totalLines) != nil {
-      totalLines += 1
-    }
-    
-    let checkStart = max(linesTop, totalLines - 4)
-    for r in checkStart..<totalLines {
-      if let line = terminal.getScrollInvariantLine(row: r) {
-        let text = line.translateToString(trimRight: true)
-        if text.contains("[Swiftty-Command-Done:") {
-          if let range = text.range(of: "[Swiftty-Command-Done:") {
-            let suffix = text[range.upperBound...]
-            if let closeRange = suffix.range(of: "]") {
-              let codeStr = suffix[..<closeRange.lowerBound]
-              let exitCode = Int32(codeStr) ?? 0
-              completeActiveCommand(exitCode: exitCode)
-              break
-            }
-          }
-        }
-      }
-    }
   }
   
   private func completeActiveCommand(exitCode: Int32) {
-    outputCheckTimer?.invalidate()
-    outputCheckTimer = nil
-    
     guard let blockID = activeBlockID,
           let idx = blocks.firstIndex(where: { $0.id == blockID }) else { return }
     
@@ -401,16 +391,9 @@ final class TerminalSession: ObservableObject, Identifiable {
       totalLines += 1
     }
     
-    var endLine = totalLines
-    for r in startLine..<totalLines {
-      if let line = terminal.getScrollInvariantLine(row: r) {
-        let text = line.translateToString(trimRight: true)
-        if text.contains("[Swiftty-Command-Done:") {
-          endLine = r
-          break
-        }
-      }
-    }
+    let linesTop = buffer.totalLinesTrimmed
+    let cursorRow = linesTop + buffer.yDisp + buffer.y
+    let endLine = max(startLine, min(totalLines, cursorRow))
     
     var richString = AttributedString("")
     for r in startLine..<endLine {
@@ -493,14 +476,78 @@ final class TerminalSession: ObservableObject, Identifiable {
 
 extension TerminalSession: LocalProcessTerminalViewDelegate {
   func sizeChanged(source: LocalProcessTerminalView, newCols: Int, newRows: Int) {}
-  func setTerminalTitle(source: LocalProcessTerminalView, title: String) {}
+  
+  func setTerminalTitle(source: LocalProcessTerminalView, title: String) {
+    if title.hasPrefix("[Swiftty-JSON-Data:") && title.hasSuffix("]") {
+      let startIdx = title.index(title.startIndex, offsetBy: 19)
+      let endIdx = title.index(title.endIndex, offsetBy: -1)
+      let hexString = String(title[startIdx..<endIdx])
+      
+      if let data = dataFromHexString(hexString) {
+        do {
+          if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+             let hook = json["hook"] as? String {
+            handleSubshellHook(hook: hook, payload: json)
+          }
+        } catch {
+          print("Failed to parse JSON hook: \(error)")
+        }
+      }
+    } else {
+      self.title = title
+    }
+  }
+  
+  private func dataFromHexString(_ hex: String) -> Data? {
+    var data = Data()
+    let hexStr = hex.trimmingCharacters(in: .whitespacesAndNewlines)
+    if hexStr.count % 2 != 0 { return nil }
+    
+    var index = hexStr.startIndex
+    while index < hexStr.endIndex {
+      let nextIndex = hexStr.index(index, offsetBy: 2)
+      let byteStr = String(hexStr[index..<nextIndex])
+      if let byte = UInt8(byteStr, radix: 16) {
+        data.append(byte)
+      } else {
+        return nil
+      }
+      index = nextIndex
+    }
+    return data
+  }
+  
+  private func handleSubshellHook(hook: String, payload: [String: Any]) {
+    switch hook {
+    case "Precmd":
+      let exitCode = (payload["exit_code"] as? Int32) ?? 0
+      let pwd = (payload["pwd"] as? String) ?? ""
+      
+      DispatchQueue.main.async {
+        if !pwd.isEmpty && pwd != self.currentDirectory {
+          self.currentDirectory = pwd
+          self.title = TerminalSession.displayPath(pwd)
+          self.updateGitInfo()
+        }
+        
+        if self.activeBlockID != nil {
+          self.completeActiveCommand(exitCode: exitCode)
+        }
+      }
+    default:
+      break
+    }
+  }
   
   func hostCurrentDirectoryUpdate(source: TerminalView, directory: String?) {
+    // Rely on Precmd hook for directory changes, but keep fallback
     if let directory = directory, !directory.isEmpty {
       DispatchQueue.main.async {
-        self.currentDirectory = directory
-        self.title = TerminalSession.displayPath(directory)
-        self.updateGitInfo()
+        if self.currentDirectory != directory {
+          self.currentDirectory = directory
+          self.title = TerminalSession.displayPath(directory)
+          self.updateGitInfo()
+        }
       }
     }
   }

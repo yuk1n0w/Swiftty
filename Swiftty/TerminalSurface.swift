@@ -118,63 +118,30 @@ class FlippedContainerView: NSView {
 struct TerminalSurface: NSViewRepresentable {
   typealias NSViewType = NSView
 
-  let currentDirectory: String
-  let command: String?
-  let handle: TerminalHandle
+  let terminalView: SwifttyTerminalView
+  let session: TerminalSession
   let onClick: (() -> Void)?
   let onSelectionChanged: (() -> Void)?
-  let onExit: ((Int32?) -> Void)?
-
-  func makeCoordinator() -> Coordinator {
-    Coordinator(self)
-  }
-
-  class Coordinator: NSObject, LocalProcessTerminalViewDelegate {
-    var parent: TerminalSurface
-
-    init(_ parent: TerminalSurface) {
-      self.parent = parent
-    }
-
-    func sizeChanged(source: LocalProcessTerminalView, newCols: Int, newRows: Int) {}
-    func setTerminalTitle(source: LocalProcessTerminalView, title: String) {}
-    func hostCurrentDirectoryUpdate(source: TerminalView, directory: String?) {}
-
-    func processTerminated(source: TerminalView, exitCode: Int32?) {
-      source.feed(text: "\u{001b}[?25l")
-      DispatchQueue.main.async {
-        self.parent.onExit?(exitCode)
-      }
-    }
-  }
 
   func makeNSView(context: Context) -> NSView {
     let container = FlippedContainerView(frame: .zero)
-    let view = SwifttyTerminalView(frame: .zero)
-    view.onClick = onClick
-    view.onSelectionChanged = onSelectionChanged
-    handle.view = view
-    view.font = NSFont.monospacedSystemFont(ofSize: 12.0, weight: .regular)
-    view.lineSpacing = 1.02
-    view.nativeBackgroundColor = NSColor(calibratedRed: 0.031, green: 0.043, blue: 0.047, alpha: 1)
-    view.nativeForegroundColor = NSColor(calibratedRed: 0.82, green: 0.89, blue: 0.89, alpha: 1)
-    view.backspaceSendsControlH = false
-    view.processDelegate = context.coordinator
-
-    container.addSubview(view)
-
-    let args: [String]
-    if let command = command {
-      args = ["-l", "-c", command]
-    } else {
-      args = ["-l"]
+    
+    // Ensure the terminal view is detached from any previous parent container
+    terminalView.removeFromSuperview()
+    
+    terminalView.onClick = onClick
+    terminalView.onSelectionChanged = onSelectionChanged
+    
+    container.addSubview(terminalView)
+    
+    // Defer pending command execution until after layout/resize pass has settled in the window
+    DispatchQueue.main.async {
+      if let cmd = session.pendingCommand {
+        session.pendingCommand = nil
+        terminalView.send(txt: cmd + "\n")
+      }
     }
-
-    view.startProcess(
-      executable: "/bin/zsh",
-      args: args,
-      currentDirectory: currentDirectory
-    )
+    
     return container
   }
 
@@ -191,9 +158,9 @@ struct TerminalSurface: NSViewRepresentable {
     )
   }
 
-  static func dismantleNSView(_ nsView: NSView, coordinator: Coordinator) {
+  static func dismantleNSView(_ nsView: NSView, coordinator: Void) {
     if let terminalView = nsView.subviews.first as? SwifttyTerminalView {
-      terminalView.terminate()
+      terminalView.removeFromSuperview()
     }
   }
 }
