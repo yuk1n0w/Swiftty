@@ -31,6 +31,15 @@ struct CommandBlockView: View {
     (isSelected && isNextSelected) ? 0 : 12
   }
 
+  private var hasOutput: Bool {
+    if block.isRunning {
+      return true
+    }
+    guard let view = block.handle.view else { return false }
+    let output = getAllOutput(for: view).trimmingCharacters(in: .whitespacesAndNewlines)
+    return !output.isEmpty
+  }
+
   // MARK: Context menu items (shared by right-click and 3-dots button)
   @ViewBuilder
   private func blockContextMenu() -> some View {
@@ -156,14 +165,16 @@ struct CommandBlockView: View {
 
         if isHovered && !block.isRunning {
           HStack(spacing: 6) {
-            SmallIconButton(
-              systemName: "line.3.horizontal.decrease.circle",
-              help: "Filter output",
-              tint: isFilterActive ? .swMint : .swMuted
-            ) {
-              withAnimation(.easeOut(duration: 0.15)) {
-                isFilterActive.toggle()
-                if !isFilterActive { filterText = "" }
+            if hasOutput {
+              SmallIconButton(
+                systemName: "line.3.horizontal.decrease.circle",
+                help: "Filter output",
+                tint: isFilterActive ? .swMint : .swMuted
+              ) {
+                withAnimation(.easeOut(duration: 0.15)) {
+                  isFilterActive.toggle()
+                  if !isFilterActive { filterText = "" }
+                }
               }
             }
 
@@ -217,20 +228,22 @@ struct CommandBlockView: View {
           }
         }
       } else {
-        TerminalSurface(
-          currentDirectory: block.directory,
-          command: block.command,
-          handle: block.handle,
-          onClick: { handleBlockClick() },
-          onSelectionChanged: {
-            session.selectedBlockIDs.removeAll()
-            session.lastSelectedBlockID = nil
+        if hasOutput {
+          TerminalSurface(
+            currentDirectory: block.directory,
+            command: block.command,
+            handle: block.handle,
+            onClick: { handleBlockClick() },
+            onSelectionChanged: {
+              session.selectedBlockIDs.removeAll()
+              session.lastSelectedBlockID = nil
+            }
+          ) { exitCode in
+            session.processTerminated(blockID: block.id, exitCode: exitCode)
           }
-        ) { exitCode in
-          session.processTerminated(blockID: block.id, exitCode: exitCode)
+          .frame(height: terminalHeight)
+          .cornerRadius(8)
         }
-        .frame(height: terminalHeight)
-        .cornerRadius(8)
       }
     }
     .padding(.horizontal, 20)
