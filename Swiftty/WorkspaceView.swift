@@ -116,6 +116,8 @@ private struct SessionWorkspaceView: View {
               CommandBlockView(block: block, session: session)
                 .id(block.id)
             }
+            Color.clear
+              .frame(height: 145)
           }
           .frame(minHeight: geometry.size.height - 20, alignment: .bottom)
           .padding(.top, 16)
@@ -162,7 +164,7 @@ private struct TerminalWorkspace: View {
   }
 
   var body: some View {
-    VStack(spacing: 0) {
+    ZStack(alignment: .bottom) {
       ZStack {
         ForEach(sessions) { session in
           SessionWorkspaceView(session: session)
@@ -184,6 +186,9 @@ private struct TerminalWorkspace: View {
           commandText = ""
           selectedSession.runCommand(cmd)
         }
+        .padding(.horizontal, 24)
+        .padding(.bottom, 24)
+        .zIndex(10)
       }
     }
     .background(Color.black)

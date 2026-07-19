@@ -94,7 +94,6 @@ struct CommandInputBar: View {
           RoundedRectangle(cornerRadius: 14)
             .stroke(Color.white.opacity(0.12), lineWidth: 0.8)
         )
-        .padding(.horizontal, 20)
         .padding(.bottom, 8)
       }
 
@@ -214,15 +213,10 @@ struct CommandInputBar: View {
           RoundedRectangle(cornerRadius: 14)
             .stroke(Color.white.opacity(0.12), lineWidth: 0.8)
         )
-        .padding(.horizontal, 20)
         .padding(.bottom, 8)
       }
 
-      Rectangle()
-        .fill(Color.swLine)
-        .frame(height: 1)
-
-      VStack(alignment: .leading, spacing: 10) {
+      VStack(alignment: .leading, spacing: 0) {
         HStack(spacing: 6) {
           SmallPromptChip(systemName: "terminal", text: "base", tint: .swMuted)
           SmallPromptChip(systemName: "folder", text: session.title, tint: .swMuted)
@@ -237,7 +231,7 @@ struct CommandInputBar: View {
           }
         }
         .padding(.horizontal, 20)
-        .padding(.top, 12)
+        .padding(.top, 14)
 
         HStack(spacing: 10) {
           ZStack(alignment: .leading) {
@@ -269,29 +263,34 @@ struct CommandInputBar: View {
           .buttonStyle(.plain)
         }
         .padding(.horizontal, 20)
+        .padding(.top, 10)
         .padding(.bottom, 6)
-      }
-      .background(Color.swPanel)
 
-      HStack(spacing: 16) {
-        HStack(spacing: 4) {
-          Text("↵")
-            .foregroundStyle(Color.swMuted)
-          Text("send command to shell")
-            .foregroundStyle(Color.swDim)
+        HStack(spacing: 16) {
+          HStack(spacing: 4) {
+            Text("↵")
+              .foregroundStyle(Color.swMuted)
+            Text("send command to shell")
+              .foregroundStyle(Color.swDim)
+          }
+          HStack(spacing: 4) {
+            Text("⌘↵")
+              .foregroundStyle(Color.swMuted)
+            Text("new line")
+              .foregroundStyle(Color.swDim)
+          }
         }
-        HStack(spacing: 4) {
-          Text("⌘↵")
-            .foregroundStyle(Color.swMuted)
-          Text("new line")
-            .foregroundStyle(Color.swDim)
-        }
+        .font(.system(size: 11, weight: .regular, design: .monospaced))
+        .padding(.horizontal, 20)
+        .padding(.bottom, 14)
+        .padding(.top, 8)
       }
-      .font(.system(size: 11, weight: .regular, design: .monospaced))
-      .padding(.horizontal, 20)
-      .padding(.bottom, 12)
-      .padding(.top, 8)
-      .background(Color.swPanel)
+      .glassEffect(.regular.tint(Color.white.opacity(0.015)), in: .rect(cornerRadius: 16))
+      .overlay(
+        RoundedRectangle(cornerRadius: 16)
+          .stroke(Color.white.opacity(0.12), lineWidth: 0.8)
+      )
+      .shadow(color: Color.black.opacity(0.4), radius: 15, x: 0, y: 8)
     }
     .onAppear {
       isFieldFocused = false
