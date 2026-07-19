@@ -34,6 +34,29 @@ final class SwifttyTerminalView: LocalProcessTerminalView {
     }
   }
 
+  private var scrollerObserver: NSKeyValueObservation?
+
+  override func addSubview(_ view: NSView) {
+    super.addSubview(view)
+    setupScrollerObserver(view)
+  }
+
+  override func addSubview(_ view: NSView, positioned place: NSWindow.OrderingMode, relativeTo otherView: NSView?) {
+    super.addSubview(view, positioned: place, relativeTo: otherView)
+    setupScrollerObserver(view)
+  }
+
+  private func setupScrollerObserver(_ view: NSView) {
+    if let scroller = view as? NSScroller {
+      scroller.isHidden = true
+      scrollerObserver = scroller.observe(\.isHidden, options: [.new]) { scroller, change in
+        if change.newValue == false {
+          scroller.isHidden = true
+        }
+      }
+    }
+  }
+
   override func mouseDown(with event: NSEvent) {
     window?.makeFirstResponder(self)
     onClick?()
