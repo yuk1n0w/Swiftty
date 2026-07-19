@@ -1,0 +1,337 @@
+import SwiftUI
+
+struct CommandInputBar: View {
+  @Binding var commandText: String
+  @ObservedObject var session: TerminalSession
+  let submit: () -> Void
+
+  @State private var isFieldFocused = true
+
+  private func confirmSuggestion(_ suggestion: String) {
+    let components = commandText.components(separatedBy: " ")
+    guard let last = components.last, !last.isEmpty else { return }
+
+    var newComponents = components
+    let suffix = suggestion.hasSuffix("/") ? "" : " "
+
+    if last.contains("/") {
+      let pathComponents = last.components(separatedBy: "/")
+      let parentPath = pathComponents.dropLast().joined(separator: "/")
+      let prefix = parentPath.isEmpty ? "" : parentPath + "/"
+      newComponents[newComponents.count - 1] = prefix + suggestion + suffix
+    } else {
+      newComponents[newComponents.count - 1] = suggestion + suffix
+    }
+
+    commandText = newComponents.joined(separator: " ")
+    session.autocompleteSuggestions = []
+    session.selectedSuggestionIndex = nil
+    session.ghostText = ""
+  }
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 0) {
+      // Suggestion Dropdown Panel (Autocomplete)
+      if session.isAutocompleteOpen && !session.autocompleteSuggestions.isEmpty {
+        VStack(alignment: .leading, spacing: 0) {
+          ScrollView {
+            VStack(alignment: .leading, spacing: 2) {
+              ForEach(Array(session.autocompleteSuggestions.enumerated()), id: \.element) { idx, suggestion in
+                let isSelected = session.selectedSuggestionIndex == idx
+                Button(action: {
+                  confirmSuggestion(suggestion)
+                }) {
+                  HStack(spacing: 12) {
+                    Image(systemName: suggestion.hasSuffix("/") ? "folder.fill" : "doc.text.fill")
+                      .font(.system(size: 11))
+                      .foregroundStyle(isSelected ? Color.white : (suggestion.hasSuffix("/") ? Color.swBlue : Color.swMuted))
+                    Text(suggestion)
+                      .font(.system(size: 13, design: .monospaced))
+                    Spacer()
+                    Text(suggestion.hasSuffix("/") ? "Folder" : "File")
+                      .font(.system(size: 11))
+                      .foregroundStyle(isSelected ? Color.white.opacity(0.7) : Color.swDim)
+                  }
+                  .padding(.horizontal, 10)
+                  .padding(.vertical, 6)
+                  .background(isSelected ? Color.swBlue : Color.clear)
+                  .foregroundStyle(isSelected ? Color.white : Color.swText)
+                  .cornerRadius(4)
+                }
+                .buttonStyle(.plain)
+              }
+            }
+            .padding(6)
+          }
+          .frame(maxHeight: 180)
+        }
+        .glassEffect(.regular.tint(Color.white.opacity(0.015)), in: .rect(cornerRadius: 8))
+        .overlay(
+          RoundedRectangle(cornerRadius: 8)
+            .stroke(Color.white.opacity(0.12), lineWidth: 0.8)
+        )
+        .padding(.horizontal, 20)
+        .padding(.bottom, 8)
+      }
+
+      // History Popup Panel
+      if session.isHistoryOpen && !session.historySuggestions.isEmpty {
+        VStack(alignment: .leading, spacing: 0) {
+          // Tab bar header
+          HStack(spacing: 16) {
+            Text("HISTORY")
+              .font(.system(size: 11, weight: .bold))
+              .foregroundStyle(Color.swMuted)
+            
+            ForEach(["All", "Commands", "Prompts"], id: \.self) { tab in
+              let isSelected = session.historyTab == tab
+              Button(action: { session.historyTab = tab }) {
+                Text(tab)
+                  .font(.system(size: 11, weight: isSelected ? .bold : .regular))
+                  .foregroundStyle(isSelected ? Color.swText : Color.swMuted)
+                  .padding(.horizontal, 8)
+                  .padding(.vertical, 3)
+                  .background(isSelected ? Color.swRaised.opacity(0.4) : Color.clear)
+                  .cornerRadius(4)
+              }
+              .buttonStyle(.plain)
+            }
+            Spacer()
+          }
+          .padding(.horizontal, 12)
+          .padding(.vertical, 8)
+          
+          Rectangle()
+            .fill(Color.white.opacity(0.08))
+            .frame(height: 0.8)
+          
+          ScrollView {
+            VStack(alignment: .leading, spacing: 1) {
+              ForEach(Array(session.historySuggestions.enumerated()), id: \.element) { idx, suggestion in
+                let isSelected = session.selectedHistoryIndex == idx
+                Button(action: {
+                  commandText = suggestion
+                  session.isHistoryOpen = false
+                  session.historySuggestions = []
+                  session.selectedHistoryIndex = nil
+                }) {
+                  HStack(spacing: 12) {
+                    Image(systemName: "terminal.fill")
+                      .font(.system(size: 10))
+                      .foregroundStyle(isSelected ? Color.white : Color.swDim)
+                    Text(suggestion)
+                      .font(.system(size: 13, design: .monospaced))
+                      .lineLimit(1)
+                    Spacer()
+                  }
+                  .padding(.horizontal, 10)
+                  .padding(.vertical, 6)
+                  .background(isSelected ? Color.swBlue : Color.clear)
+                  .foregroundStyle(isSelected ? Color.white : Color.swText)
+                  .cornerRadius(4)
+                }
+                .buttonStyle(.plain)
+              }
+            }
+            .padding(6)
+          }
+          .frame(maxHeight: 200)
+          
+          Rectangle()
+            .fill(Color.white.opacity(0.08))
+            .frame(height: 0.8)
+          
+          // Footer hints
+          HStack(spacing: 12) {
+            HStack(spacing: 3) {
+              Text("↑")
+                .font(.system(size: 9))
+                .padding(.horizontal, 4)
+                .padding(.vertical, 1)
+                .background(Color.swRaised)
+                .cornerRadius(3)
+              Text("↓")
+                .font(.system(size: 9))
+                .padding(.horizontal, 4)
+                .padding(.vertical, 1)
+                .background(Color.swRaised)
+                .cornerRadius(3)
+              Text("to navigate")
+                .foregroundStyle(Color.swDim)
+            }
+            HStack(spacing: 3) {
+              Text("⇧ tab")
+                .font(.system(size: 9))
+                .padding(.horizontal, 4)
+                .padding(.vertical, 1)
+                .background(Color.swRaised)
+                .cornerRadius(3)
+              Text("to cycle tabs")
+                .foregroundStyle(Color.swDim)
+            }
+            HStack(spacing: 3) {
+              Text("esc")
+                .font(.system(size: 9))
+                .padding(.horizontal, 4)
+                .padding(.vertical, 1)
+                .background(Color.swRaised)
+                .cornerRadius(3)
+              Text("to dismiss")
+                .foregroundStyle(Color.swDim)
+            }
+            Spacer()
+          }
+          .font(.system(size: 10, design: .monospaced))
+          .padding(.horizontal, 12)
+          .padding(.vertical, 6)
+        }
+        .glassEffect(.regular.tint(Color.white.opacity(0.015)), in: .rect(cornerRadius: 8))
+        .overlay(
+          RoundedRectangle(cornerRadius: 8)
+            .stroke(Color.white.opacity(0.12), lineWidth: 0.8)
+        )
+        .padding(.horizontal, 20)
+        .padding(.bottom, 8)
+      }
+
+      Rectangle()
+        .fill(Color.swLine)
+        .frame(height: 1)
+
+      VStack(alignment: .leading, spacing: 10) {
+        HStack(spacing: 6) {
+          SmallPromptChip(systemName: "terminal", text: "base", tint: .swMuted)
+          SmallPromptChip(systemName: "folder", text: session.title, tint: .swMuted)
+
+          if let git = session.gitInfo {
+            SmallPromptChip(systemName: "arrow.triangle.pull", text: git.branch, tint: .swMint)
+
+            let disp = git.displayString
+            if !disp.isEmpty {
+              SmallPromptChip(systemName: "doc.text", text: disp, tint: .swAmber)
+            }
+          }
+        }
+        .padding(.horizontal, 20)
+        .padding(.top, 12)
+
+        HStack(spacing: 10) {
+          ZStack(alignment: .leading) {
+            // Render inline ghost text completion using spaces padding
+            if !session.ghostText.isEmpty {
+              Text(String(repeating: " ", count: commandText.count) + session.ghostText)
+                .font(.system(size: 14, weight: .regular, design: .monospaced))
+                .foregroundStyle(Color.swMuted.opacity(0.6))
+                .allowsHitTesting(false)
+            }
+
+            AutocompleteTextField(
+              text: $commandText,
+              placeholder: "Run a command...",
+              currentDirectory: session.currentDirectory,
+              isFocused: isFieldFocused,
+              session: session,
+              onSubmit: submit
+            )
+            .frame(height: 22)
+          }
+
+          Button(action: submit) {
+            Image(systemName: "return")
+              .font(.system(size: 13, weight: .semibold))
+              .foregroundStyle(Color.swMuted)
+              .frame(width: 28, height: 28)
+          }
+          .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 20)
+        .padding(.bottom, 6)
+      }
+      .background(Color.swPanel)
+
+      HStack(spacing: 16) {
+        HStack(spacing: 4) {
+          Text("↵")
+            .foregroundStyle(Color.swMuted)
+          Text("send command to shell")
+            .foregroundStyle(Color.swDim)
+        }
+        HStack(spacing: 4) {
+          Text("⌘↵")
+            .foregroundStyle(Color.swMuted)
+          Text("new line")
+            .foregroundStyle(Color.swDim)
+        }
+      }
+      .font(.system(size: 11, weight: .regular, design: .monospaced))
+      .padding(.horizontal, 20)
+      .padding(.bottom, 12)
+      .padding(.top, 8)
+      .background(Color.swPanel)
+    }
+    .onAppear {
+      isFieldFocused = false
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+        isFieldFocused = true
+      }
+    }
+    .onChange(of: session.id) { _, _ in
+      isFieldFocused = false
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+        isFieldFocused = true
+      }
+    }
+    .onChange(of: session.blocks.count) { _, _ in
+      isFieldFocused = false
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+        isFieldFocused = true
+      }
+    }
+  }
+}
+
+struct SmallPromptChip: View {
+  let systemName: String?
+  let text: String
+  let tint: SwiftUI.Color
+
+  var body: some View {
+    HStack(spacing: 5) {
+      if let systemName {
+        Image(systemName: systemName)
+          .font(.system(size: 9, weight: .semibold))
+      }
+      Text(text)
+    }
+    .foregroundStyle(tint)
+    .font(.system(size: 11, weight: .medium, design: .monospaced))
+    .padding(.horizontal, 8)
+    .padding(.vertical, 4.5)
+    .background(Color.swRaised.opacity(0.55), in: RoundedRectangle(cornerRadius: 6))
+    .overlay(
+      RoundedRectangle(cornerRadius: 6)
+        .stroke(Color.swLine, lineWidth: 0.6)
+    )
+  }
+}
+
+struct PromptChip: View {
+  let systemName: String?
+  let text: String
+  let tint: SwiftUI.Color
+
+  var body: some View {
+    HStack(spacing: 6) {
+      if let systemName {
+        Image(systemName: systemName)
+          .font(.system(size: 10, weight: .semibold))
+      }
+      Text(text)
+    }
+    .foregroundStyle(tint)
+    .font(.system(size: 12, weight: .medium, design: .monospaced))
+    .padding(.horizontal, 9)
+    .padding(.vertical, 7)
+    .glassEffect(.clear, in: .rect(cornerRadius: 6))
+  }
+}
