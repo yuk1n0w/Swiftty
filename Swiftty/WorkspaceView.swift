@@ -110,13 +110,14 @@ private struct SessionWorkspaceView: View {
     GeometryReader { geometry in
       ScrollViewReader { proxy in
         ScrollView {
-          VStack(spacing: 8) {
+          VStack(spacing: 16) {
             Spacer()
             ForEach(session.blocks) { block in
               CommandBlockView(block: block, session: session)
                 .id(block.id)
             }
           }
+          .padding(.horizontal, 16)
           .frame(minHeight: geometry.size.height - 160, alignment: .bottom)
           .padding(.top, 16)
         }
