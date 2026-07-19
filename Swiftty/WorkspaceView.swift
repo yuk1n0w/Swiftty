@@ -116,12 +116,11 @@ private struct SessionWorkspaceView: View {
               CommandBlockView(block: block, session: session)
                 .id(block.id)
             }
-            Color.clear
-              .frame(height: 145)
           }
-          .frame(minHeight: geometry.size.height - 20, alignment: .bottom)
+          .frame(minHeight: geometry.size.height - 160, alignment: .bottom)
           .padding(.top, 16)
         }
+        .padding(.bottom, 140)
         .onChange(of: session.blocks) { oldValue, newValue in
           if let lastBlock = newValue.last {
             withAnimation(.easeOut(duration: 0.2)) {
