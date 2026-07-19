@@ -118,7 +118,7 @@ struct CommandInputBar: View {
           
           ScrollView {
             VStack(alignment: .leading, spacing: 1) {
-              ForEach(Array(session.historySuggestions.enumerated()), id: \.element) { idx, suggestion in
+              ForEach(Array(session.historySuggestions.enumerated().reversed()), id: \.element) { idx, suggestion in
                 let isSelected = session.selectedHistoryIndex == idx
                 Button(action: {
                   commandText = suggestion

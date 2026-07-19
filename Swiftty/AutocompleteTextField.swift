@@ -167,7 +167,7 @@ struct AutocompleteTextField: NSViewRepresentable {
          commandSelector == Selector(("insertTabIgnoringFieldEditor:")) {
         if session.isHistoryOpen {
           let isShift = NSEvent.modifierFlags.contains(.shift)
-          navigateHistory(isForward: !isShift)
+          navigateHistory(isForward: isShift)
         } else {
           handleTabOrNavigation(textField: textField, isForward: true)
         }
@@ -176,7 +176,7 @@ struct AutocompleteTextField: NSViewRepresentable {
 
       if commandSelector == #selector(NSResponder.moveDown(_:)) {
         if session.isHistoryOpen {
-          navigateHistory(isForward: true)
+          navigateHistory(isForward: false)
           return true
         } else if session.isAutocompleteOpen {
           handleTabOrNavigation(textField: textField, isForward: true)
@@ -186,7 +186,7 @@ struct AutocompleteTextField: NSViewRepresentable {
 
       if commandSelector == #selector(NSResponder.moveUp(_:)) {
         if session.isHistoryOpen {
-          navigateHistory(isForward: false)
+          navigateHistory(isForward: true)
           return true
         } else if session.isAutocompleteOpen {
           handleTabOrNavigation(textField: textField, isForward: false)
