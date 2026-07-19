@@ -13,6 +13,24 @@ struct CommandBlockView: View {
 
   private var isSelected: Bool { session.selectedBlockIDs.contains(block.id) }
 
+  private var isPrevSelected: Bool {
+    guard let idx = session.blocks.firstIndex(where: { $0.id == block.id }), idx > 0 else { return false }
+    return session.selectedBlockIDs.contains(session.blocks[idx - 1].id)
+  }
+
+  private var isNextSelected: Bool {
+    guard let idx = session.blocks.firstIndex(where: { $0.id == block.id }), idx < session.blocks.count - 1 else { return false }
+    return session.selectedBlockIDs.contains(session.blocks[idx + 1].id)
+  }
+
+  private var topRadius: CGFloat {
+    (isSelected && isPrevSelected) ? 0 : 12
+  }
+
+  private var bottomRadius: CGFloat {
+    (isSelected && isNextSelected) ? 0 : 12
+  }
+
   // MARK: Context menu items (shared by right-click and 3-dots button)
   @ViewBuilder
   private func blockContextMenu() -> some View {
@@ -218,19 +236,29 @@ struct CommandBlockView: View {
     .padding(.horizontal, 20)
     .padding(.vertical, 14)
     .background(
-      RoundedRectangle(cornerRadius: 12)
-        .fill(
-          isSelected
-            ? Color(red: 0.063, green: 0.165, blue: 0.208)
-            : (isHovered ? Color.swRaised.opacity(0.18) : Color.clear)
-        )
+      UnequallyRoundedRectShape(
+        topLeading: topRadius,
+        bottomLeading: bottomRadius,
+        bottomTrailing: bottomRadius,
+        topTrailing: topRadius
+      )
+      .fill(
+        isSelected
+          ? Color(red: 0.063, green: 0.165, blue: 0.208)
+          : (isHovered ? Color.swRaised.opacity(0.18) : Color.clear)
+      )
     )
     .overlay(
-      RoundedRectangle(cornerRadius: 12)
-        .stroke(
-          isSelected ? Color.swBlue.opacity(0.6) : (isHovered ? Color.swLine : Color.clear),
-          lineWidth: isSelected ? 1.0 : 0.8
-        )
+      UnequallyRoundedRectShape(
+        topLeading: topRadius,
+        bottomLeading: bottomRadius,
+        bottomTrailing: bottomRadius,
+        topTrailing: topRadius
+      )
+      .stroke(
+        isSelected ? Color.swBlue.opacity(0.6) : (isHovered ? Color.swLine : Color.clear),
+        lineWidth: isSelected ? 1.0 : 0.8
+      )
     )
     .onHover { hovering in
       withAnimation(.easeOut(duration: 0.15)) {
@@ -428,3 +456,79 @@ func parseANSIText(_ text: String) -> Text {
   }
   return Text(attributed)
 }
+
+struct UnequallyRoundedRectShape: Shape {
+  var topLeading: CGFloat
+  var bottomLeading: CGFloat
+  var bottomTrailing: CGFloat
+  var topTrailing: CGFloat
+
+  func path(in rect: CGRect) -> Path {
+    var path = Path()
+    let w = rect.width
+    let h = rect.height
+    
+    // Start at top-middle
+    path.move(to: CGPoint(x: w / 2, y: 0))
+    
+    // Top-right corner
+    path.addLine(to: CGPoint(x: w - topTrailing, y: 0))
+    if topTrailing > 0 {
+      path.addArc(
+        center: CGPoint(x: w - topTrailing, y: topTrailing),
+        radius: topTrailing,
+        startAngle: Angle(degrees: -90),
+        endAngle: Angle(degrees: 0),
+        clockwise: false
+      )
+    } else {
+      path.addLine(to: CGPoint(x: w, y: 0))
+    }
+    
+    // Bottom-right corner
+    path.addLine(to: CGPoint(x: w, y: h - bottomTrailing))
+    if bottomTrailing > 0 {
+      path.addArc(
+        center: CGPoint(x: w - bottomTrailing, y: h - bottomTrailing),
+        radius: bottomTrailing,
+        startAngle: Angle(degrees: 0),
+        endAngle: Angle(degrees: 90),
+        clockwise: false
+      )
+    } else {
+      path.addLine(to: CGPoint(x: w, y: h))
+    }
+    
+    // Bottom-left corner
+    path.addLine(to: CGPoint(x: bottomLeading, y: h))
+    if bottomLeading > 0 {
+      path.addArc(
+        center: CGPoint(x: bottomLeading, y: h - bottomLeading),
+        radius: bottomLeading,
+        startAngle: Angle(degrees: 90),
+        endAngle: Angle(degrees: 180),
+        clockwise: false
+      )
+    } else {
+      path.addLine(to: CGPoint(x: 0, y: h))
+    }
+    
+    // Top-left corner
+    path.addLine(to: CGPoint(x: 0, y: topLeading))
+    if topLeading > 0 {
+      path.addArc(
+        center: CGPoint(x: topLeading, y: topLeading),
+        radius: topLeading,
+        startAngle: Angle(degrees: 180),
+        endAngle: Angle(degrees: 270),
+        clockwise: false
+      )
+    } else {
+      path.addLine(to: CGPoint(x: 0, y: 0))
+    }
+    
+    path.closeSubpath()
+    return path
+  }
+}
+

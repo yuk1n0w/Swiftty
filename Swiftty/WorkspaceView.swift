@@ -110,11 +110,15 @@ private struct SessionWorkspaceView: View {
     GeometryReader { geometry in
       ScrollViewReader { proxy in
         ScrollView {
-          VStack(spacing: 16) {
+          VStack(spacing: 0) {
             Spacer()
-            ForEach(session.blocks) { block in
+            ForEach(Array(session.blocks.enumerated()), id: \.element.id) { idx, block in
+              let nextBlockSelected = (idx < session.blocks.count - 1) &&
+                                      session.selectedBlockIDs.contains(block.id) &&
+                                      session.selectedBlockIDs.contains(session.blocks[idx + 1].id)
               CommandBlockView(block: block, session: session)
                 .id(block.id)
+                .padding(.bottom, nextBlockSelected ? 0 : 16)
             }
           }
           .padding(.horizontal, 16)
