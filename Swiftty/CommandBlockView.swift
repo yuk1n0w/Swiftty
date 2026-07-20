@@ -48,7 +48,10 @@ struct CommandBlockView: View {
   private func staticOutputView(_ output: AttributedString) -> some View {
     Text(output)
       .font(.system(size: 12, design: .monospaced))
-      .lineSpacing(4)
+      // Match the live SwiftTerm view's tight row height (it uses a 1.02
+      // line-height multiplier). A larger value spreads the frozen output
+      // out so it no longer lines up with how it looked while running.
+      .lineSpacing(1)
       .textSelection(.enabled)
       .foregroundStyle(Color.swText)
       .frame(maxWidth: .infinity, alignment: .leading)
@@ -278,7 +281,7 @@ struct CommandBlockView: View {
         Text(filtered)
           .font(.system(size: 12, design: .monospaced))
           .foregroundStyle(Color.swText)
-          .lineSpacing(4)
+          .lineSpacing(1)
           .textSelection(.enabled)
       }
       .frame(maxWidth: .infinity, alignment: .leading)
