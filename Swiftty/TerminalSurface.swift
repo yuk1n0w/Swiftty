@@ -4,7 +4,8 @@ import SwiftTerm
 import SwiftUI
 
 final class SwifttyTerminalView: LocalProcessTerminalView {
-  private var configuredMetal = false
+  var onClick: (() -> Void)?
+  var onSelectionChanged: (() -> Void)?
 
   /// Computes the cell height from the terminal font metrics so the host
   /// can build accurate content-based frame sizes.
@@ -27,17 +28,46 @@ final class SwifttyTerminalView: LocalProcessTerminalView {
   override func viewDidMoveToWindow() {
     super.viewDidMoveToWindow()
 
-    guard window != nil, !configuredMetal else { return }
-    configuredMetal = (try? setUseMetal(true)) != nil
     DispatchQueue.main.async { [weak self] in
       guard let self, let window = self.window else { return }
       window.makeFirstResponder(self)
     }
   }
 
+  private var scrollerObserver: NSKeyValueObservation?
+
+  override func addSubview(_ view: NSView) {
+    super.addSubview(view)
+    setupScrollerObserver(view)
+  }
+
+  override func addSubview(_ view: NSView, positioned place: NSWindow.OrderingMode, relativeTo otherView: NSView?) {
+    super.addSubview(view, positioned: place, relativeTo: otherView)
+    setupScrollerObserver(view)
+  }
+
+  private func setupScrollerObserver(_ view: NSView) {
+    if let scroller = view as? NSScroller {
+      scroller.isHidden = true
+      scrollerObserver = scroller.observe(\.isHidden, options: [.new]) { scroller, change in
+        if change.newValue == false {
+          scroller.isHidden = true
+        }
+      }
+    }
+  }
+
   override func mouseDown(with event: NSEvent) {
     window?.makeFirstResponder(self)
+    onClick?()
     super.mouseDown(with: event)
+  }
+
+  override func mouseUp(with event: NSEvent) {
+    super.mouseUp(with: event)
+    if selectionActive {
+      onSelectionChanged?()
+    }
   }
 }
 
@@ -81,63 +111,56 @@ final class TerminalHandle {
   }
 }
 
+class FlippedContainerView: NSView {
+  override var isFlipped: Bool { true }
+}
+
 struct TerminalSurface: NSViewRepresentable {
-  let currentDirectory: String
-  let command: String?
-  let handle: TerminalHandle
-  let onExit: ((Int32?) -> Void)?
+  typealias NSViewType = NSView
 
-  func makeCoordinator() -> Coordinator {
-    Coordinator(self)
-  }
+  let terminalView: SwifttyTerminalView
+  let session: TerminalSession
+  let onClick: (() -> Void)?
+  let onSelectionChanged: (() -> Void)?
 
-  class Coordinator: NSObject, LocalProcessTerminalViewDelegate {
-    var parent: TerminalSurface
-
-    init(_ parent: TerminalSurface) {
-      self.parent = parent
-    }
-
-    func sizeChanged(source: LocalProcessTerminalView, newCols: Int, newRows: Int) {}
-    func setTerminalTitle(source: LocalProcessTerminalView, title: String) {}
-    func hostCurrentDirectoryUpdate(source: TerminalView, directory: String?) {}
-
-    func processTerminated(source: TerminalView, exitCode: Int32?) {
-      source.feed(text: "\u{001b}[?25l")
-      DispatchQueue.main.async {
-        self.parent.onExit?(exitCode)
+  func makeNSView(context: Context) -> NSView {
+    let container = FlippedContainerView(frame: .zero)
+    
+    // Ensure the terminal view is detached from any previous parent container
+    terminalView.removeFromSuperview()
+    
+    terminalView.onClick = onClick
+    terminalView.onSelectionChanged = onSelectionChanged
+    
+    container.addSubview(terminalView)
+    
+    // Defer pending command execution until after layout/resize pass has settled in the window
+    DispatchQueue.main.async {
+      if let cmd = session.pendingCommand {
+        session.pendingCommand = nil
+        terminalView.send(txt: cmd + "\n")
       }
     }
+    
+    return container
   }
 
-  func makeNSView(context: Context) -> SwifttyTerminalView {
-    let view = SwifttyTerminalView(frame: .zero)
-    handle.view = view
-    view.font = NSFont.monospacedSystemFont(ofSize: 12.0, weight: .regular)
-    view.lineSpacing = 1.02
-    view.nativeBackgroundColor = NSColor(calibratedRed: 0.031, green: 0.043, blue: 0.047, alpha: 1)
-    view.nativeForegroundColor = NSColor(calibratedRed: 0.82, green: 0.89, blue: 0.89, alpha: 1)
-    view.backspaceSendsControlH = false
-    view.processDelegate = context.coordinator
-
-    let args: [String]
-    if let command = command {
-      args = ["-l", "-c", command]
-    } else {
-      args = ["-l"]
-    }
-
-    view.startProcess(
-      executable: "/bin/zsh",
-      args: args,
-      currentDirectory: currentDirectory
+  func updateNSView(_ nsView: NSView, context: Context) {
+    guard let terminalView = nsView.subviews.first as? SwifttyTerminalView else { return }
+    let ch = terminalView.cellHeight
+    let minHeight = 24 * ch
+    let targetHeight = max(minHeight, nsView.bounds.height)
+    terminalView.frame = NSRect(
+      x: 0,
+      y: 0,
+      width: nsView.bounds.width,
+      height: targetHeight
     )
-    return view
   }
 
-  func updateNSView(_ nsView: SwifttyTerminalView, context: Context) {}
-
-  static func dismantleNSView(_ nsView: SwifttyTerminalView, coordinator: Coordinator) {
-    nsView.terminate()
+  static func dismantleNSView(_ nsView: NSView, coordinator: Void) {
+    if let terminalView = nsView.subviews.first as? SwifttyTerminalView {
+      terminalView.removeFromSuperview()
+    }
   }
 }
