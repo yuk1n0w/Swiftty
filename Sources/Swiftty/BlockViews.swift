@@ -477,10 +477,19 @@ struct BlockStack<Terminal: View>: View {
 
     /// Expands the token under the caret against PATH and the filesystem.
     private func completeToken(_ text: String, _ caret: Int) -> (String, Int)? {
+        // Remote sessions resolve paths on the far end. A miss returns nil and
+        // fires a request, so a second Tab completes once the answer lands.
+        let lister: Completion.Lister? = tracker.subshell == nil ? nil : { path in
+            if let entries = tracker.remoteEntries(for: path) { return entries }
+            tracker.requestRemoteListing(path)
+            return nil
+        }
+
         guard let result = Completion.complete(
             text: text,
             caret: caret,
-            directory: tracker.workingDirectory
+            directory: tracker.workingDirectory,
+            lister: lister
         ) else { return nil }
         return (result.text, result.caret)
     }

@@ -145,6 +145,14 @@ final class BlockTracker: ObservableObject {
     /// Height the live terminal needs while sitting at a prompt.
     @Published private(set) var idleTerminalHeight: CGFloat = 44
 
+    /// Directory listings fetched from the far end, keyed by absolute path.
+    ///
+    /// Completion and the file explorer read local disk, which is the wrong
+    /// machine entirely once a session is remote. The shell on the other end
+    /// answers these instead.
+    @Published private(set) var remoteListings: [String: [String]] = [:]
+    private var pendingListings: Set<String> = []
+    private var subshellWatch: Task<Void, Never>?
     private var gitBranchCache: [String: String?] = [:]
     private weak var terminalView: SwifttyTerminalView?
     private var pendingCommand: String?
@@ -386,12 +394,15 @@ final class BlockTracker: ObservableObject {
         switch kind {
         case "S":
             adoptSubshell(named: argument)
+        case "L":
+            receiveListing(argument)
         case "P":
             if let directory = argument.flatMap(Self.decodeHex),
                !directory.isEmpty,
                directory != currentDirectory {
                 currentDirectory = directory
                 refreshGitBranch(for: directory)
+                if subshell != nil { requestRemoteListing(directory) }
             }
         case "A":
             beginPrompt()
@@ -406,6 +417,136 @@ final class BlockTracker: ObservableObject {
         }
     }
 
+    /// Asks the far end what is in `path`, unless it is already known or in
+    /// flight. Answers arrive as an `L` marker.
+    func requestRemoteListing(_ path: String) {
+        guard subshell != nil, let view = terminalView else { return }
+        guard remoteListings[path] == nil, !pendingListings.contains(path) else { return }
+        // Never interrupt a running command with a query.
+        guard runningBlock == nil, !isSubmitting else { return }
+
+        pendingListings.insert(path)
+        let quoted = path.replacingOccurrences(of: "'", with: "'\\''")
+        view.send(txt: " __swiftty_ls '\(quoted)'\n")
+    }
+
+    /// Entries the far end reported for `path`, if it has answered yet.
+    func remoteEntries(for path: String) -> [String]? {
+        remoteListings[path]
+    }
+
+    private func receiveListing(_ argument: String?) {
+        guard let argument, let separator = argument.firstIndex(of: "|") else { return }
+        let path = Self.decodeHex(String(argument[argument.startIndex..<separator]))
+        let body = Self.decodeHex(String(argument[argument.index(after: separator)...]))
+        guard let path, let body else { return }
+
+        pendingListings.remove(path)
+        remoteListings[path] = body
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .map(String.init)
+    }
+
+    /// Watches an SSH session for a prompt, then installs the hooks itself.
+    ///
+    /// The `133;S` handshake below is the reliable path, but it needs a line
+    /// added to the shell config on every host you connect to. Most of the time
+    /// nobody has done that, so this covers the common case without any remote
+    /// setup: wait for the output to go quiet on something that looks like a
+    /// shell prompt, then type the hooks in.
+    ///
+    /// It waits for quiet, and checks the line looks like a prompt rather than
+    /// a question, specifically so it cannot type a page of shell functions
+    /// into a password or passphrase prompt.
+    private func watchForSubshell(command: String) {
+        subshellWatch?.cancel()
+        guard Self.opensInteractiveSession(command) else { return }
+
+        subshellWatch = Task { [weak self] in
+            var previous: String?
+            // Roughly twelve seconds, enough for a slow connection and a
+            // remote rc file, then give up rather than fire into whatever the
+            // session has become.
+            for _ in 0..<40 {
+                try? await Task.sleep(for: .milliseconds(300))
+                guard !Task.isCancelled, let self, self.subshell == nil else { return }
+
+                let line = self.lastVisibleLine()
+                // Two identical samples means output has stopped arriving.
+                if line == previous, Self.looksLikePrompt(line) {
+                    self.installSubshellHooks()
+                    return
+                }
+                previous = line
+            }
+        }
+    }
+
+    /// True for `ssh host`, false for `ssh host -- some command`, which runs
+    /// and exits without ever presenting a prompt.
+    private static func opensInteractiveSession(_ command: String) -> Bool {
+        let words = command.split(separator: " ").map(String.init)
+        guard let first = words.first, first == "ssh" else { return false }
+        // Flags and their values, then exactly one host, is the interactive
+        // form. Anything trailing the host is a remote command.
+        var operands: [String] = []
+        var index = 1
+        while index < words.count {
+            let word = words[index]
+            if word.hasPrefix("-") {
+                // Flags that take a value swallow the next word.
+                if "bcDEeFIiJLlmOopQRSWw".contains(word.dropFirst().prefix(1)), word.count == 2 {
+                    index += 1
+                }
+            } else {
+                operands.append(word)
+            }
+            index += 1
+        }
+        return operands.count == 1
+    }
+
+    private static func looksLikePrompt(_ line: String?) -> Bool {
+        guard let line else { return false }
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return false }
+        // A question is not a prompt. Typing into one would send a page of
+        // shell functions somewhere it must never go.
+        let lowered = trimmed.lowercased()
+        for probe in ["password", "passphrase", "(yes/no", "verification code", "otp"]
+        where lowered.contains(probe) {
+            return false
+        }
+        return "$%#>".contains(trimmed.last ?? " ")
+    }
+
+    /// The last row of the terminal that has anything on it.
+    private func lastVisibleLine() -> String? {
+        guard let terminal = terminalView?.terminal else { return nil }
+        let buffer = terminal.buffer
+        let cursor = buffer.totalLinesTrimmed + buffer.yDisp + buffer.y
+        for row in stride(from: cursor, through: max(0, cursor - 4), by: -1) {
+            guard let line = terminal.getScrollInvariantLine(row: row) else { continue }
+            let text = line.translateToString(trimRight: true)
+            if !text.trimmingCharacters(in: .whitespaces).isEmpty { return text }
+        }
+        return nil
+    }
+
+    /// Types the hooks into whatever shell is on the other end.
+    private func installSubshellHooks(named name: String? = nil) {
+        guard let view = terminalView else { return }
+        remoteListings.removeAll()
+        pendingListings.removeAll()
+        subshell = name ?? "ssh"
+        runningBlock = nil
+        isSubmitting = false
+        subshellWatch?.cancel()
+
+        // Leading space so shells with HIST_IGNORE_SPACE keep it out of history.
+        view.send(txt: " " + ShellIntegration.portableSubshellBootstrap + "\n")
+    }
+
     /// `S` arrives from a shell that has just sourced its rc file somewhere we
     /// do not control — over SSH, or inside a container.
     ///
@@ -414,19 +555,16 @@ final class BlockTracker: ObservableObject {
     /// same markers the local one does and its commands become blocks. The
     /// echoed setup line is cleaned up by the reset on the next prompt.
     private func adoptSubshell(named argument: String?) {
-        let name = (argument?.isEmpty == false ? argument! : "sh")
-        guard let flavor = ShellIntegration.Flavor(shellPath: name),
-              let view = terminalView else { return }
-
-        subshell = name
         // The command that opened the subshell — `ssh host` — never returns to
         // a local prompt, so its block would otherwise stay running forever and
         // hold the composer off screen for the whole session.
-        runningBlock = nil
-        isSubmitting = false
+        installSubshellHooks(named: argument?.isEmpty == false ? argument : nil)
+    }
 
-        // Leading space so shells with HIST_IGNORE_SPACE keep it out of history.
-        view.send(txt: " " + ShellIntegration.subshellBootstrap(for: flavor) + "\n")
+    /// Installs the hooks on demand, for a session the watcher did not catch —
+    /// a container, or a host whose prompt does not look like one.
+    func warpifySession() {
+        installSubshellHooks(named: subshell ?? "shell")
     }
 
     /// `A` arrives from precmd, before the prompt is printed.
@@ -447,6 +585,7 @@ final class BlockTracker: ObservableObject {
     private func beginOutput() {
         isSubmitting = false
         focusTerminal()
+        watchForSubshell(command: pendingCommand ?? "")
 
         let row = outputBoundaryRow() ?? promptRow
         outputStartRow = row
@@ -463,6 +602,14 @@ final class BlockTracker: ObservableObject {
     /// `D` arrives from the next precmd, after the output and before the next
     /// prompt is drawn.
     private func endCommand(exitCode: Int32) {
+        // A local command finished, so we are back at the local prompt.
+        subshellWatch?.cancel()
+        if subshell != nil {
+            subshell = nil
+            remoteListings.removeAll()
+            pendingListings.removeAll()
+        }
+
         guard var block = runningBlock else { return }
         runningBlock = nil
 

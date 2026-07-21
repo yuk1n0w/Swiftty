@@ -80,9 +80,24 @@ session that is already open. The remote shell then emits the same markers the
 local one does, so its commands become blocks. Settings → General has the
 snippet to copy.
 
+Most hosts have no such line, so an interactive `ssh` is also detected
+directly: Swiftty waits for the output to go quiet on something that looks like
+a shell prompt, then types the hooks in. It checks for a prompt rather than a
+question specifically so it can never type into a password or passphrase
+prompt, and it ignores `ssh host -- command`, which never presents one. `⇧⌘E`
+does it by hand for anything the watcher misses.
+
 The command that opened the subshell (`ssh host`) never returns to a local
-prompt, so the handshake also closes out its block; otherwise it would sit
-"running" for the whole session and keep the composer off screen.
+prompt, so adoption also closes out its block; otherwise it would sit "running"
+for the whole session and keep the composer off screen.
+
+Tab completion and the file explorer follow the session onto the remote host.
+The bootstrap carries an `__swiftty_ls` helper that reports a directory back as
+an `L` marker, so both read the far end's filesystem rather than the local disk,
+which merely happens to have paths that resolve. Those queries are filtered out
+of the block stream by the same preexec guard, so they never appear as commands.
+Command-name completion is suppressed while remote, since the local `PATH` says
+nothing about what is installed there.
 
 `BlockTracker` captures a block's output as styled text when the command
 finishes, then clears the terminal buffer at the *next* prompt marker rather

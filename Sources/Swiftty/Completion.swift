@@ -17,8 +17,19 @@ enum Completion {
         let candidates: [String]
     }
 
+    /// Directory contents, however they are obtained.
+    ///
+    /// Local sessions read the disk; a remote session asks the shell on the far
+    /// end, because the local filesystem is the wrong machine entirely.
+    typealias Lister = (String) -> [String]?
+
     /// Expands the token ending at `caret`, or returns nil if nothing matches.
-    static func complete(text: String, caret: Int, directory: String) -> Result? {
+    static func complete(
+        text: String,
+        caret: Int,
+        directory: String,
+        lister: Lister? = nil
+    ) -> Result? {
         let characters = Array(text)
         let caret = min(max(caret, 0), characters.count)
 
@@ -27,8 +38,8 @@ enum Completion {
         let token = String(characters[start..<caret])
 
         let matches = isCommandPosition(characters, before: start)
-            ? executables(matching: token)
-            : paths(matching: token, in: directory)
+            ? executables(matching: token, in: directory, lister: lister)
+            : paths(matching: token, in: directory, lister: lister)
         guard !matches.isEmpty else { return nil }
 
         // With several candidates, extend as far as they agree and leave the
@@ -64,7 +75,11 @@ enum Completion {
 
     // MARK: - Paths
 
-    private static func paths(matching token: String, in directory: String) -> [String] {
+    private static func paths(
+        matching token: String,
+        in directory: String,
+        lister: Lister? = nil
+    ) -> [String] {
         let expanded = (token as NSString).expandingTildeInPath
         let isAbsolute = expanded.hasPrefix("/")
 
@@ -82,7 +97,11 @@ enum Completion {
         let resolved = isAbsolute || lastSlash != nil
             ? searchDirectory
             : directory
-        guard let entries = try? FileManager.default.contentsOfDirectory(atPath: resolved) else {
+        // A remote lister already marks directories with a trailing slash;
+        // the local branch has to stat for it below.
+        let remote = lister?(resolved)
+        guard let entries = remote
+            ?? (try? FileManager.default.contentsOfDirectory(atPath: resolved)) else {
             return []
         }
 
@@ -93,10 +112,20 @@ enum Completion {
         return entries
             .filter { $0.hasPrefix(searchPrefix) && (showsHidden || !$0.hasPrefix(".")) }
             .map { entry -> String in
-                var isDirectory: ObjCBool = false
-                let full = (resolved as NSString).appendingPathComponent(entry)
-                manager.fileExists(atPath: full, isDirectory: &isDirectory)
-                let suffix = isDirectory.boolValue ? "/" : ""
+                var entry = entry
+                var suffix = ""
+                if remote != nil {
+                    // `ls -p` already appended the slash.
+                    if entry.hasSuffix("/") {
+                        entry.removeLast()
+                        suffix = "/"
+                    }
+                } else {
+                    var isDirectory: ObjCBool = false
+                    let full = (resolved as NSString).appendingPathComponent(entry)
+                    manager.fileExists(atPath: full, isDirectory: &isDirectory)
+                    suffix = isDirectory.boolValue ? "/" : ""
+                }
 
                 // Rebuild the candidate in the shape the user typed it, so a
                 // relative token stays relative and `~` stays `~`.
@@ -115,12 +144,20 @@ enum Completion {
 
     // MARK: - Commands
 
-    private static func executables(matching token: String) -> [String] {
+    private static func executables(
+        matching token: String,
+        in directory: String,
+        lister: Lister?
+    ) -> [String] {
         guard !token.isEmpty else { return [] }
         // A token that looks like a path is a path, even in command position.
         if token.contains("/") || token.hasPrefix("~") || token.hasPrefix(".") {
-            return paths(matching: token, in: FileManager.default.currentDirectoryPath)
+            return paths(matching: token, in: directory, lister: lister)
         }
+        // The local PATH says nothing about what is installed on a remote host,
+        // so a remote session offers no command completion rather than a list
+        // of programs that are not there.
+        guard lister == nil else { return [] }
         return commandNames.filter { $0.hasPrefix(token) }.sorted()
     }
 

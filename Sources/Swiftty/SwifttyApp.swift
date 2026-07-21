@@ -660,6 +660,11 @@ struct SwifttyApp: App {
                 }
                 .keyboardShortcut("s", modifiers: .command)
 
+                Button("Enable Blocks in This Session") {
+                    store.activeBlockTracker?.warpifySession()
+                }
+                .keyboardShortcut("e", modifiers: [.command, .shift])
+
                 Button("Find in Blocks") {
                     store.beginSearch()
                 }
@@ -1204,6 +1209,13 @@ struct WorkspaceSidebar: View {
                     .font(.system(size: 13, weight: .medium))
                     .foregroundStyle(.secondary)
 
+                if let host = explorerModel.remoteHost {
+                    Image(systemName: "link")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(.blue)
+                        .help("Showing files on \(host)")
+                }
+
                 Text(explorerModel.rootLabel)
                     .font(.system(size: 13, weight: .semibold))
                     .lineLimit(1)
@@ -1306,7 +1318,30 @@ struct WorkspaceSidebar: View {
         }
         .background(Surface.chrome)
         .onChange(of: tracker.currentDirectory, initial: true) { _, directory in
+            syncExplorer(directory: directory)
+        }
+        .onChange(of: tracker.subshell, initial: true) { _, _ in
+            syncExplorer(directory: tracker.currentDirectory)
+        }
+        .onChange(of: tracker.remoteListings) { _, _ in
+            syncExplorer(directory: tracker.currentDirectory)
+        }
+    }
+}
+
+extension WorkspaceSidebar {
+    /// Points the explorer at whichever machine the shell is actually on.
+    fileprivate func syncExplorer(directory: String) {
+        guard let host = tracker.subshell else {
+            explorerModel.showLocal()
             explorerModel.setRoot(URL(fileURLWithPath: directory))
+            return
+        }
+
+        if let entries = tracker.remoteEntries(for: directory) {
+            explorerModel.showRemote(host: host, path: directory, entries: entries)
+        } else {
+            tracker.requestRemoteListing(directory)
         }
     }
 }
@@ -1465,6 +1500,10 @@ final class FileExplorerModel: ObservableObject {
 
     private(set) var showHidden = false
     @Published private(set) var rootURL = FileManager.default.homeDirectoryForCurrentUser
+    /// Set while the explorer is showing a remote host's files, which arrive
+    /// from the shell on the far end rather than from local disk.
+    @Published private(set) var remoteHost: String?
+    private var remoteEntries: [String] = []
 
     init() {
         refresh()
@@ -1475,6 +1514,49 @@ final class FileExplorerModel: ObservableObject {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         if rootURL.path == home { return "~" }
         return rootURL.lastPathComponent.isEmpty ? rootURL.path : rootURL.lastPathComponent
+    }
+
+    /// Shows a listing that came back from a remote shell.
+    ///
+    /// Local disk is the wrong machine once a session is remote — the paths
+    /// happen to resolve, which makes the wrong answer look like a right one.
+    func showRemote(host: String, path: String, entries: [String]) {
+        remoteHost = host
+        remoteEntries = entries
+        rootURL = URL(fileURLWithPath: path)
+        expandedPaths.removeAll()
+        childrenByPath.removeAll()
+        selectedPath = nil
+        rebuildRemoteRows()
+    }
+
+    /// Returns to the local filesystem when a remote session ends.
+    func showLocal() {
+        guard remoteHost != nil else { return }
+        remoteHost = nil
+        remoteEntries = []
+        refresh()
+    }
+
+    private func rebuildRemoteRows() {
+        let base = rootURL.path
+        rootEntries = remoteEntries
+            .filter { showHidden || !$0.hasPrefix(".") }
+            .map { entry in
+                let isDirectory = entry.hasSuffix("/")
+                let name = isDirectory ? String(entry.dropLast()) : entry
+                return FileExplorerEntry(
+                    id: (base as NSString).appendingPathComponent(name),
+                    url: URL(fileURLWithPath: (base as NSString).appendingPathComponent(name)),
+                    name: name,
+                    isDirectory: isDirectory
+                )
+            }
+            .sorted { lhs, rhs in
+                lhs.isDirectory == rhs.isDirectory
+                    ? lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+                    : lhs.isDirectory
+            }
     }
 
     /// Points the explorer at a new directory, following the shell.
@@ -1504,6 +1586,10 @@ final class FileExplorerModel: ObservableObject {
         if let showHidden {
             self.showHidden = showHidden
         }
+        if remoteHost != nil {
+            rebuildRemoteRows()
+            return
+        }
 
         rootEntries = loadDirectory(rootURL)
         let loadedPaths = Array(childrenByPath.keys)
@@ -1520,7 +1606,9 @@ final class FileExplorerModel: ObservableObject {
 
     func activate(_ entry: FileExplorerEntry) {
         selectedPath = entry.id
-        guard entry.isDirectory else { return }
+        // Expanding a remote folder would need another round trip; the shell's
+        // own `cd` is the way to move around a remote tree for now.
+        guard entry.isDirectory, remoteHost == nil else { return }
 
         if expandedPaths.contains(entry.id) {
             expandedPaths.remove(entry.id)
@@ -1670,6 +1758,10 @@ struct CommandPaletteView: View {
             CommandPaletteRow(title: "Toggle file explorer", shortcut: "⌘S", systemName: "sidebar.left") {
                 store.toggleSidebar()
                 onDismiss()
+            }
+            CommandPaletteRow(title: "Enable blocks in this session", shortcut: "⇧⌘E", systemName: "link") {
+                onDismiss()
+                store.activeBlockTracker?.warpifySession()
             }
             CommandPaletteRow(title: "Find in blocks", shortcut: "⌘F", systemName: "magnifyingglass") {
                 onDismiss()

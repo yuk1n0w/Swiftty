@@ -92,11 +92,12 @@ enum ShellIntegration {
         switch flavor {
         case .zsh:
             return [
-                #"__swiftty_mark() { builtin printf '\e]133;%s\a' "$1" }"#,
-                #"__swiftty_hex() { builtin printf '%s' "$1" | command od -An -v -tx1 | command tr -d ' \n' }"#,
-                #"__swiftty_capture_status() { __swiftty_status=$? }"#,
-                #"__swiftty_precmd() { if [[ -n "$__swiftty_running" ]]; then __swiftty_mark "D;${__swiftty_status:-0}"; unset __swiftty_running; fi; __swiftty_mark "P;$(__swiftty_hex "$PWD")"; __swiftty_mark "A" }"#,
-                #"__swiftty_preexec() { __swiftty_running=1; __swiftty_mark "P;$(__swiftty_hex "$PWD")"; __swiftty_mark "E;$(__swiftty_hex "$1")"; __swiftty_mark "C" }"#,
+                #"__swiftty_mark() { builtin printf '\e]133;%s\a' "$1"; }"#,
+                #"__swiftty_hex() { builtin printf '%s' "$1" | command od -An -v -tx1 | command tr -d ' \n'; }"#,
+                #"__swiftty_capture_status() { __swiftty_status=$?; }"#,
+                #"__swiftty_precmd() { if [[ -n "$__swiftty_running" ]]; then __swiftty_mark "D;${__swiftty_status:-0}"; unset __swiftty_running; fi; __swiftty_mark "P;$(__swiftty_hex "$PWD")"; __swiftty_mark "A"; }"#,
+                #"__swiftty_preexec() { case "$1" in *__swiftty_*) return ;; esac; __swiftty_running=1; __swiftty_mark "P;$(__swiftty_hex "$PWD")"; __swiftty_mark "E;$(__swiftty_hex "$1")"; __swiftty_mark "C"; }"#,
+                #"__swiftty_ls() { __swiftty_mark "L;$(__swiftty_hex "$1")|$(__swiftty_hex "$(command ls -1Ap -- "$1" 2>/dev/null | head -400)")"; }"#,
                 #"autoload -Uz add-zsh-hook"#,
                 #"precmd_functions=(__swiftty_capture_status $precmd_functions)"#,
                 #"add-zsh-hook precmd __swiftty_precmd"#,
@@ -109,10 +110,23 @@ enum ShellIntegration {
                 #"__swiftty_hex() { printf '%s' "$1" | od -An -v -tx1 | tr -d ' \n'; }"#,
                 #"__swiftty_preexec() { [ -n "$COMP_LINE" ] && return 0; [ -n "$__swiftty_running" ] && return 0; case "$BASH_COMMAND" in __swiftty_*|*__swiftty_precmd*) return 0 ;; esac; __swiftty_running=1; __swiftty_mark "P;$(__swiftty_hex "$PWD")"; __swiftty_mark "E;$(__swiftty_hex "$BASH_COMMAND")"; __swiftty_mark "C"; return 0; }"#,
                 #"__swiftty_precmd() { local s=$?; if [ -n "$__swiftty_running" ]; then __swiftty_mark "D;$s"; unset __swiftty_running; fi; __swiftty_mark "P;$(__swiftty_hex "$PWD")"; __swiftty_mark "A"; }"#,
+                #"__swiftty_ls() { __swiftty_mark "L;$(__swiftty_hex "$1")|$(__swiftty_hex "$(command ls -1Ap -- "$1" 2>/dev/null | head -400)")"; }"#,
                 #"PROMPT_COMMAND="__swiftty_precmd${PROMPT_COMMAND:+; $PROMPT_COMMAND}""#,
                 #"trap '__swiftty_preexec' DEBUG"#,
             ].joined(separator: "; ")
         }
+    }
+
+    /// Both bootstraps behind a runtime shell test, for sessions where the far
+    /// end's shell is unknown — an SSH host, a container.
+    ///
+    /// Each branch has to *parse* under the other shell even though only one
+    /// runs, which is why both stick to syntax the two have in common.
+    static var portableSubshellBootstrap: String {
+        let zsh = subshellBootstrap(for: .zsh)
+        let bash = subshellBootstrap(for: .bash)
+        return "if [ -n \"$ZSH_VERSION\" ]; then \(zsh); "
+            + "elif [ -n \"$BASH_VERSION\" ]; then \(bash); fi"
     }
 
     /// Removes the per-tab integration directory once its shell has exited.
@@ -190,7 +204,7 @@ enum ShellIntegration {
       # we grab the real exit status in a hook forced to the front of the list
       # and emit the marker from one appended to the back — that way the D
       # marker lands immediately before the prompt is drawn.
-      __swiftty_capture_status() { __swiftty_status=$? }
+      __swiftty_capture_status() { __swiftty_status=$?; }
 
       __swiftty_precmd() {
         if [[ -n "$__swiftty_running" ]]; then
