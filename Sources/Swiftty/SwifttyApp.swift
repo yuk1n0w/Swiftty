@@ -168,6 +168,25 @@ final class AppPreferences: ObservableObject {
     @Published var terminalCursorBlink: Bool {
         didSet { persist("terminalCursorBlink", terminalCursorBlink) }
     }
+    /// How much of the desktop shows through the window, 0.5–1.0.
+    @Published var windowOpacity: Double {
+        didSet { persist("windowOpacity", windowOpacity) }
+    }
+    /// Frosts whatever is behind the window instead of showing it sharply.
+    @Published var windowBlur: Bool {
+        didSet { persist("windowBlur", windowBlur) }
+    }
+    /// Width of the file explorer, in points.
+    @Published var sidebarWidth: Double {
+        didSet { persist("sidebarWidth", sidebarWidth) }
+    }
+    /// Tightens the spacing between blocks to fit more on screen.
+    @Published var compactBlocks: Bool {
+        didSet { persist("compactBlocks", compactBlocks) }
+    }
+
+    /// True when the window should let the desktop through at all.
+    var isTranslucent: Bool { windowOpacity < 0.99 }
     @Published var shellPath: String {
         didSet { persist("shellPath", shellPath) }
     }
@@ -218,6 +237,10 @@ final class AppPreferences: ObservableObject {
         showHiddenFiles = defaults.bool(forKey: "showHiddenFiles")
         terminalFontSize = defaults.object(forKey: "terminalFontSize") as? Double ?? 13
         terminalCursorBlink = defaults.object(forKey: "terminalCursorBlink") as? Bool ?? true
+        windowOpacity = defaults.object(forKey: "windowOpacity") as? Double ?? 0.75
+        windowBlur = defaults.object(forKey: "windowBlur") as? Bool ?? true
+        compactBlocks = defaults.object(forKey: "compactBlocks") as? Bool ?? false
+        sidebarWidth = defaults.object(forKey: "sidebarWidth") as? Double ?? 260
         shellPath = defaults.string(forKey: "shellPath") ?? ShellInfo.path
         let provider = AIProvider(rawValue: defaults.string(forKey: "aiProvider") ?? "OpenAI") ?? .openAI
         selectedProvider = provider
@@ -569,7 +592,12 @@ struct SwifttyApp: App {
                 .environmentObject(store)
                 .environmentObject(preferences)
                 .frame(minWidth: 860, minHeight: 540)
+                .ignoresSafeArea(.container, edges: .top)
         }
+        // Drops the title bar so the tab strip becomes the top of the window.
+        // The traffic lights stay, floating over the chrome row, which is why
+        // that row carries a leading inset wide enough to clear them.
+        .windowStyle(.hiddenTitleBar)
         .commands {
             CommandGroup(after: .newItem) {
                 Button("New Tab") {
@@ -605,6 +633,16 @@ struct SwifttyApp: App {
                     .keyboardShortcut("9", modifiers: .command)
                     .disabled(store.tabs.count < 9)
 
+                Button("Next Tab") {
+                    store.selectRelativeTab(by: 1)
+                }
+                .keyboardShortcut(.tab, modifiers: .control)
+
+                Button("Previous Tab") {
+                    store.selectRelativeTab(by: -1)
+                }
+                .keyboardShortcut(.tab, modifiers: [.control, .shift])
+
                 Button("Close Tab") {
                     store.closeActiveTab()
                 }
@@ -614,6 +652,38 @@ struct SwifttyApp: App {
                     store.toggleAIPanel()
                 }
                 .keyboardShortcut("i", modifiers: .command)
+
+                Divider()
+
+                Button("Toggle File Explorer") {
+                    store.toggleSidebar()
+                }
+                .keyboardShortcut("s", modifiers: .command)
+
+                Button("Find in Blocks") {
+                    store.beginSearch()
+                }
+                .keyboardShortcut("f", modifiers: .command)
+
+                Button("Clear Blocks") {
+                    store.clearBlocks()
+                }
+                .keyboardShortcut("k", modifiers: .command)
+
+                Button("Previous Block") {
+                    store.stepBlockSelection(by: -1)
+                }
+                .keyboardShortcut(.upArrow, modifiers: .command)
+
+                Button("Next Block") {
+                    store.stepBlockSelection(by: 1)
+                }
+                .keyboardShortcut(.downArrow, modifiers: .command)
+
+                Button("Copy Block Output") {
+                    store.copySelectedBlockOutput()
+                }
+                .keyboardShortcut("c", modifiers: [.command, .shift])
             }
 
             SwifttyCommands()
@@ -629,8 +699,23 @@ final class TerminalStore: ObservableObject {
     @Published private(set) var activeTabID: TerminalTab.ID
     @Published var sidebarVisible = true
     @Published var aiPanelVisible = false
+    /// Filters the block history. Empty shows everything.
+    @Published var searchQuery = ""
+    /// The find bar is only on screen while searching.
+    @Published var searchVisible = false
+    /// Bumped by ⌘F to pull focus into the search field.
+    @Published var searchFocusRequests = 0
+    /// Which match Return has stepped to. Wrapped against the match count.
+    @Published var searchMatchIndex = 0
     @Published private(set) var aiMessages: [AIMessage] = []
     @Published private(set) var aiSending = false
+
+    /// One block tracker per tab, kept here so the panel and the terminal view
+    /// share the same one and it outlives SwiftUI view updates.
+    ///
+    /// Deliberately not `@Published`: views observe individual trackers, and
+    /// publishing the dictionary would fire while a view body is reading it.
+    private var blockTrackers: [TerminalTab.ID: BlockTracker] = [:]
 
     let preferences: AppPreferences
 
@@ -639,6 +724,7 @@ final class TerminalStore: ObservableObject {
         let initialTab = TerminalTab()
         tabs = [initialTab]
         activeTabID = initialTab.id
+        blockTrackers[initialTab.id] = BlockTracker()
     }
 
     var activeTab: TerminalTab? {
@@ -647,6 +733,7 @@ final class TerminalStore: ObservableObject {
 
     func newTab() {
         let tab = TerminalTab()
+        blockTrackers[tab.id] = BlockTracker()
         tabs.append(tab)
         activeTabID = tab.id
     }
@@ -656,9 +743,33 @@ final class TerminalStore: ObservableObject {
         activeTabID = tabID
     }
 
+    /// Cycles tabs, wrapping at either end.
+    func selectRelativeTab(by offset: Int) {
+        guard tabs.count > 1,
+              let current = tabs.firstIndex(where: { $0.id == activeTabID }) else { return }
+        let next = (current + offset + tabs.count) % tabs.count
+        activeTabID = tabs[next].id
+    }
+
     func select(index: Int) {
         guard tabs.indices.contains(index) else { return }
         activeTabID = tabs[index].id
+    }
+
+    func beginSearch() {
+        searchVisible = true
+        searchFocusRequests += 1
+    }
+
+    func endSearch() {
+        searchVisible = false
+        searchQuery = ""
+        searchMatchIndex = 0
+    }
+
+    /// Return in the search field steps to the next match.
+    func advanceSearchMatch(by offset: Int = 1) {
+        searchMatchIndex += offset
     }
 
     func toggleSidebar() {
@@ -667,6 +778,40 @@ final class TerminalStore: ObservableObject {
 
     func toggleAIPanel() {
         aiPanelVisible.toggle()
+    }
+
+    /// The tracker for a tab. Trackers are created alongside their tab, so the
+    /// fallback here only ever fires for a tab that has already been closed.
+    func blockTracker(for tabID: TerminalTab.ID) -> BlockTracker {
+        blockTrackers[tabID] ?? BlockTracker()
+    }
+
+    var activeBlockTracker: BlockTracker? {
+        blockTrackers[activeTabID]
+    }
+
+    /// Wipes the active tab's block history.
+    func clearBlocks() {
+        activeBlockTracker?.clearHistory()
+    }
+
+    /// Moves the block selection in the active tab. `offset` is -1 for the
+    /// previous block, +1 for the next.
+    func stepBlockSelection(by offset: Int) {
+        activeBlockTracker?.moveSelection(by: offset)
+    }
+
+    /// Copies the selected block's output, falling back to the most recent
+    /// finished block when nothing is selected.
+    func copySelectedBlockOutput() {
+        guard let tracker = activeBlockTracker else { return }
+        let block = tracker.selectedBlock
+            ?? tracker.blocks.last { !$0.command.isEmpty }
+        guard let block else { return }
+
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(tracker.plainOutput(for: block), forType: .string)
     }
 
     func clearAIChat() {
@@ -714,6 +859,8 @@ final class TerminalStore: ObservableObject {
 
         let closingID = tabs[index].id
         tabs.remove(at: index)
+        blockTrackers.removeValue(forKey: closingID)
+        ShellIntegration.cleanUp(tabID: closingID)
         guard closingID == activeTabID else { return }
         activeTabID = tabs[min(index, tabs.count - 1)].id
     }
@@ -760,23 +907,31 @@ struct TerminalWorkspace: View {
     @EnvironmentObject private var preferences: AppPreferences
 
     var body: some View {
-        VStack(spacing: 0) {
-            WorkspaceChrome()
+        ZStack {
+            WindowBackdrop(
+                opacity: preferences.windowOpacity,
+                blurred: preferences.windowBlur
+            )
 
-            HSplitView {
-                if store.sidebarVisible {
-                    WorkspaceSidebar()
-                        .frame(minWidth: 220, idealWidth: 260, maxWidth: 480)
+            VStack(spacing: 0) {
+                WorkspaceChrome()
+
+                HStack(spacing: 0) {
+                    if store.sidebarVisible {
+                        WorkspaceSidebar(tracker: store.blockTracker(for: store.activeTabID))
+                            .frame(width: preferences.sidebarWidth)
+                            .transition(.move(edge: .leading).combined(with: .opacity))
+
+                        SidebarResizer()
+                    }
+
+                    WorkspaceMain()
+                        .frame(minWidth: 420, maxWidth: .infinity, maxHeight: .infinity)
                 }
-
-                WorkspaceMain()
-                    .frame(minWidth: 420, maxWidth: .infinity, maxHeight: .infinity)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .animation(.easeOut(duration: 0.24), value: store.sidebarVisible)
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-
-            WorkspaceStatusBar()
         }
-        .background(Color(nsColor: .windowBackgroundColor))
         .preferredColorScheme(preferredColorScheme)
     }
 
@@ -794,54 +949,107 @@ struct WorkspaceChrome: View {
     @State private var commandPalettePresented = false
 
     var body: some View {
-        HStack(spacing: 6) {
-            ChromeButton(systemName: "sidebar.left", help: "Toggle sidebar") {
-                store.toggleSidebar()
-            }
+        Group {
+            HStack(spacing: 8) {
+                HStack(spacing: 2) {
+                    ChromeButton(systemName: "sidebar.left", help: "Toggle sidebar") {
+                        store.toggleSidebar()
+                    }
 
-            ChromeButton(systemName: "command", help: "Command palette") {
-                commandPalettePresented.toggle()
-            }
-            .popover(isPresented: $commandPalettePresented, arrowEdge: .top) {
-                CommandPaletteView {
-                    commandPalettePresented = false
+                    ChromeButton(systemName: "command", help: "Command palette") {
+                        commandPalettePresented.toggle()
+                    }
+                    .popover(isPresented: $commandPalettePresented, arrowEdge: .top) {
+                        CommandPaletteView {
+                            commandPalettePresented = false
+                        }
+                        .environmentObject(store)
+                        .frame(width: 290)
+                    }
                 }
-                .environmentObject(store)
-                .frame(width: 290)
-            }
+                .padding(.horizontal, 5)
+                .padding(.vertical, 3)
+                .background(Color.white.opacity(0.06))
+                .clipShape(Capsule())
 
-            Divider()
-                .frame(height: 18)
-                .padding(.horizontal, 3)
+                HStack(spacing: 5) {
+                    Text("Default")
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(.tertiary)
+                }
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 4)
 
-            HStack(spacing: 5) {
-                Text("Default")
-                Image(systemName: "chevron.right")
-                    .font(.system(size: 9, weight: .semibold))
-                    .foregroundStyle(.tertiary)
-            }
-            .font(.system(size: 12, weight: .medium))
-            .foregroundStyle(.secondary)
-            .padding(.horizontal, 7)
+                TerminalTabStrip()
 
-            TerminalTabStrip()
+                Spacer(minLength: 8)
 
-            Spacer(minLength: 8)
-
-            SearchField()
-            ChromeButton(systemName: "bell", help: "Notifications") {}
-            ChromeButton(systemName: "gearshape", help: "Settings") {
-                SettingsCoordinator.open(tab: .general)
+                HStack(spacing: 2) {
+                    ChromeButton(
+                        systemName: "sparkles",
+                        help: store.aiPanelVisible ? "Close AI agent (⌘I)" : "Open AI agent (⌘I)"
+                    ) {
+                        store.toggleAIPanel()
+                    }
+                    ChromeButton(systemName: "bell", help: "Notifications") {}
+                    ChromeButton(systemName: "gearshape", help: "Settings") {
+                        SettingsCoordinator.open(tab: .general)
+                    }
+                }
+                .padding(.horizontal, 5)
+                .padding(.vertical, 3)
+                .background(Color.white.opacity(0.06))
+                .clipShape(Capsule())
             }
         }
-        .padding(.horizontal, 8)
-        .frame(height: 40)
-        .background(Color(nsColor: .windowBackgroundColor).opacity(0.94))
+        // Leaves room for the traffic lights, which now float over this row
+        // rather than sitting in a title bar of their own.
+        .padding(.leading, 82)
+        .padding(.trailing, 8)
+        .frame(height: 46)
+        .background {
+            // Without this the row would swallow drags and the window could
+            // only be moved by its edges.
+            Surface.chrome
+                .contentShape(Rectangle())
+                .gesture(WindowDragGesture())
+        }
         .overlay(alignment: .bottom) {
             Rectangle()
                 .fill(Color.white.opacity(0.07))
                 .frame(height: 1)
         }
+    }
+}
+
+/// The drag handle between the explorer and the terminal.
+struct SidebarResizer: View {
+    @EnvironmentObject private var preferences: AppPreferences
+    @State private var isHovering = false
+
+    var body: some View {
+        Rectangle()
+            .fill(Color.white.opacity(isHovering ? 0.14 : 0.07))
+            .frame(width: 1)
+            .frame(maxHeight: .infinity)
+            // The hit area is wider than the hairline, or the handle would be
+            // almost impossible to grab.
+            .contentShape(Rectangle().inset(by: -4))
+            .onHover { hovering in
+                isHovering = hovering
+                if hovering { NSCursor.resizeLeftRight.push() } else { NSCursor.pop() }
+            }
+            .gesture(
+                DragGesture(coordinateSpace: .global)
+                    .onChanged { value in
+                        preferences.sidebarWidth = min(max(
+                            preferences.sidebarWidth + value.translation.width, 200
+                        ), 520)
+                    }
+            )
+            .animation(.easeOut(duration: 0.12), value: isHovering)
     }
 }
 
@@ -863,31 +1071,16 @@ struct ChromeButton: View {
     }
 }
 
-struct SearchField: View {
-    var body: some View {
-        HStack(spacing: 6) {
-            Image(systemName: "magnifyingglass")
-                .font(.system(size: 12, weight: .medium))
-
-            Text("Search (⌘F)")
-                .font(.system(size: 11, weight: .medium))
-        }
-        .foregroundStyle(.secondary)
-        .padding(.horizontal, 10)
-        .frame(width: 188, height: 26, alignment: .leading)
-        .background(Color.white.opacity(0.055))
-        .clipShape(Capsule())
-    }
-}
 
 struct TerminalTabStrip: View {
     @EnvironmentObject private var store: TerminalStore
 
     var body: some View {
-        HStack(spacing: 2) {
+        Group {
+        HStack(spacing: 4) {
             ForEach(store.tabs) { tab in
                 TerminalTabButton(
-                    tab: tab,
+                    tracker: store.blockTracker(for: tab.id),
                     isActive: tab.id == store.activeTabID,
                     onSelect: { store.select(tab.id) }
                 )
@@ -897,35 +1090,42 @@ struct TerminalTabStrip: View {
                 store.newTab()
             }
         }
+        }
         .frame(maxWidth: 420, alignment: .leading)
     }
 }
 
 struct TerminalTabButton: View {
-    let tab: TerminalTab
+    // Observed, not read through the store: the label changes when a command
+    // starts or the directory moves, and the store publishes neither.
+    @ObservedObject var tracker: BlockTracker
     let isActive: Bool
     let onSelect: () -> Void
 
     var body: some View {
         Button(action: onSelect) {
             HStack(spacing: 7) {
-                Image(systemName: "terminal")
+                Image(systemName: tracker.runningBlock == nil
+                    ? "terminal"
+                    : "circle.dotted")
                     .font(.system(size: 12, weight: .medium))
+                    .symbolEffect(.pulse, isActive: tracker.runningBlock != nil)
 
-                Text(tab.displayLabel)
+                Text(tracker.tabLabel)
                     .font(.system(size: 12, weight: isActive ? .semibold : .regular))
                     .lineLimit(1)
             }
-            .padding(.horizontal, 9)
-            .frame(height: 28)
+            .padding(.horizontal, 12)
+            .frame(height: 30)
+            .contentShape(Capsule())
         }
         .buttonStyle(.plain)
         .foregroundStyle(isActive ? .primary : .secondary)
-        .background(isActive ? Color.white.opacity(0.07) : Color.clear)
-        .clipShape(RoundedRectangle(cornerRadius: 6))
-        .contentShape(Rectangle())
+        .background(isActive ? Color.white.opacity(0.08) : Color.clear)
+        .clipShape(Capsule())
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("Terminal tab " + tab.title)
+        .accessibilityLabel("Terminal tab " + tracker.tabLabel)
+        .animation(.easeOut(duration: 0.15), value: tracker.tabLabel)
     }
 }
 
@@ -940,35 +1140,48 @@ extension TerminalTab {
 
 struct WorkspaceMain: View {
     @EnvironmentObject private var store: TerminalStore
+    @EnvironmentObject private var preferences: AppPreferences
 
     var body: some View {
         HStack(spacing: 0) {
             ZStack {
                 ForEach(store.tabs) { tab in
-                    TerminalSessionView(
-                        tabID: tab.id,
-                        isActive: tab.id == store.activeTabID,
-                        onTitle: { store.updateTitle($0, for: tab.id) },
-                        onDirectory: { store.updateDirectory($0, for: tab.id) },
-                        onExit: { store.markExited(for: tab.id, code: $0) }
+                    let tracker = store.blockTracker(for: tab.id)
+                    BlockStack(
+                        tracker: tracker,
+                        terminal: TerminalSessionView(
+                            tabID: tab.id,
+                            isActive: tab.id == store.activeTabID,
+                            // While the shell waits at a prompt the editor owns
+                            // the keyboard; the terminal takes it back for a
+                            // running command, a full-screen program, or a shell
+                            // we could not instrument.
+                            wantsFocus: tracker.runningBlock != nil
+                                || tracker.isAlternateScreen
+                                || !tracker.isIntegrationActive,
+                            tracker: tracker,
+                            onTitle: { store.updateTitle($0, for: tab.id) },
+                            onDirectory: { store.updateDirectory($0, for: tab.id) },
+                            onExit: { store.markExited(for: tab.id, code: $0) }
+                        )
                     )
                     .opacity(tab.id == store.activeTabID ? 1 : 0)
                     .allowsHitTesting(tab.id == store.activeTabID)
                     .accessibilityHidden(tab.id != store.activeTabID)
                 }
             }
-            .padding(.horizontal, 12)
-            .padding(.top, 10)
-            .padding(.bottom, 8)
+            .padding(.top, 6)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
 
             if store.aiPanelVisible {
                 Divider()
                 AIAgentPanel()
                     .frame(width: 340)
+                    .transition(.move(edge: .trailing).combined(with: .opacity))
             }
         }
-        .background(Color(nsColor: NSColor(calibratedWhite: 0.055, alpha: 1)))
+        .animation(.easeOut(duration: 0.24), value: store.aiPanelVisible)
+        
     }
 }
 
@@ -978,6 +1191,8 @@ enum SidebarView: String {
 }
 
 struct WorkspaceSidebar: View {
+    @ObservedObject var tracker: BlockTracker
+
     @State private var activeView: SidebarView = .files
     @State private var searchPresented = false
     @StateObject private var explorerModel = FileExplorerModel()
@@ -989,8 +1204,11 @@ struct WorkspaceSidebar: View {
                     .font(.system(size: 13, weight: .medium))
                     .foregroundStyle(.secondary)
 
-                Text(ShellInfo.userName)
+                Text(explorerModel.rootLabel)
                     .font(.system(size: 13, weight: .semibold))
+                    .lineLimit(1)
+                    .truncationMode(.head)
+                    .help(explorerModel.rootURL.path)
 
                 Spacer(minLength: 0)
 
@@ -1067,13 +1285,15 @@ struct WorkspaceSidebar: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
 
-            HStack(spacing: 3) {
-                SidebarRailButton(title: "Files", systemName: "folder", isActive: activeView == .files) {
-                    activeView = .files
-                }
+            Group {
+                HStack(spacing: 3) {
+                    SidebarRailButton(title: "Files", systemName: "folder", isActive: activeView == .files) {
+                        activeView = .files
+                    }
 
-                SidebarRailButton(title: "Source Control", systemName: "arrow.triangle.branch", isActive: activeView == .sourceControl) {
-                    activeView = .sourceControl
+                    SidebarRailButton(title: "Source Control", systemName: "arrow.triangle.branch", isActive: activeView == .sourceControl) {
+                        activeView = .sourceControl
+                    }
                 }
             }
             .padding(5)
@@ -1084,7 +1304,10 @@ struct WorkspaceSidebar: View {
                     .frame(height: 1)
             }
         }
-        .background(Color(nsColor: .windowBackgroundColor).opacity(0.92))
+        .background(Surface.chrome)
+        .onChange(of: tracker.currentDirectory, initial: true) { _, directory in
+            explorerModel.setRoot(URL(fileURLWithPath: directory))
+        }
     }
 }
 
@@ -1112,11 +1335,14 @@ struct FileExplorerPreview: View {
                         depth: 0,
                         model: model
                     )
+                    .transition(.opacity)
                 }
             }
             .padding(.vertical, 7)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .animation(.easeOut(duration: 0.2), value: model.rootURL)
+        .animation(.easeOut(duration: 0.15), value: model.expandedPaths)
         .onAppear {
             model.refresh(showHidden: preferences.showHiddenFiles)
         }
@@ -1210,12 +1436,15 @@ struct SidebarRailButton: View {
             Label(title, systemImage: systemName)
                 .font(.system(size: 10, weight: .medium))
                 .frame(maxWidth: .infinity)
-                .padding(.vertical, 5)
+                // Enough vertical room that the capsule is a pill rather than
+                // a squashed oval.
+                .padding(.vertical, 7)
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .foregroundStyle(isActive ? Color.primary : Color.secondary)
-        .background(isActive ? Color.white.opacity(0.07) : Color.clear)
-        .clipShape(RoundedRectangle(cornerRadius: 5))
+        .background(isActive ? Color.white.opacity(0.08) : Color.clear)
+        .clipShape(Capsule())
     }
 }
 
@@ -1235,9 +1464,35 @@ final class FileExplorerModel: ObservableObject {
     @Published var searchQuery = ""
 
     private(set) var showHidden = false
-    let rootURL = FileManager.default.homeDirectoryForCurrentUser
+    @Published private(set) var rootURL = FileManager.default.homeDirectoryForCurrentUser
 
     init() {
+        refresh()
+    }
+
+    /// Home shows as `~`, everything else by its own folder name.
+    var rootLabel: String {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        if rootURL.path == home { return "~" }
+        return rootURL.lastPathComponent.isEmpty ? rootURL.path : rootURL.lastPathComponent
+    }
+
+    /// Points the explorer at a new directory, following the shell.
+    ///
+    /// Expansion and selection are dropped rather than carried over: they are
+    /// keyed by absolute path, and holding on to paths from the old tree would
+    /// leave rows expanded that are no longer part of it.
+    func setRoot(_ url: URL) {
+        let resolved = url.standardizedFileURL
+        guard resolved != rootURL else { return }
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: resolved.path, isDirectory: &isDirectory),
+              isDirectory.boolValue else { return }
+
+        rootURL = resolved
+        expandedPaths.removeAll()
+        childrenByPath.removeAll()
+        selectedPath = nil
         refresh()
     }
 
@@ -1395,47 +1650,6 @@ final class FileExplorerModel: ObservableObject {
     }
 }
 
-struct WorkspaceStatusBar: View {
-    @EnvironmentObject private var store: TerminalStore
-
-    var body: some View {
-        HStack(spacing: 8) {
-            Button {} label: {
-                HStack(spacing: 5) {
-                    Image(systemName: "house")
-                        .font(.system(size: 11, weight: .medium))
-                    Text("Home")
-                    Image(systemName: "chevron.down")
-                        .font(.system(size: 8, weight: .semibold))
-                }
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(.secondary)
-
-            Spacer(minLength: 8)
-
-            Button { store.toggleAIPanel() } label: {
-                HStack(spacing: 5) {
-                    Image(systemName: "sparkles")
-                    Text(store.aiPanelVisible ? "Close AI agent" : "Open AI agent")
-                    Text("⌘I")
-                        .foregroundStyle(.tertiary)
-                }
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(.secondary)
-        }
-        .font(.system(size: 11, weight: .medium))
-        .padding(.horizontal, 12)
-        .frame(height: 36)
-        .background(Color(nsColor: .windowBackgroundColor).opacity(0.92))
-        .overlay(alignment: .top) {
-            Rectangle()
-                .fill(Color.white.opacity(0.07))
-                .frame(height: 1)
-        }
-    }
-}
 
 struct CommandPaletteView: View {
     @EnvironmentObject private var store: TerminalStore
@@ -1453,8 +1667,16 @@ struct CommandPaletteView: View {
                 store.newTab()
                 onDismiss()
             }
-            CommandPaletteRow(title: "Toggle sidebar", shortcut: nil, systemName: "sidebar.left") {
+            CommandPaletteRow(title: "Toggle file explorer", shortcut: "⌘S", systemName: "sidebar.left") {
                 store.toggleSidebar()
+                onDismiss()
+            }
+            CommandPaletteRow(title: "Find in blocks", shortcut: "⌘F", systemName: "magnifyingglass") {
+                onDismiss()
+                store.beginSearch()
+            }
+            CommandPaletteRow(title: "Clear blocks", shortcut: "⌘K", systemName: "square.stack.3d.up.slash") {
+                store.clearBlocks()
                 onDismiss()
             }
             CommandPaletteRow(
@@ -1474,7 +1696,9 @@ struct CommandPaletteView: View {
                 SettingsCoordinator.open(tab: .models)
             }
         }
-        .padding(.bottom, 8)
+        .padding(.vertical, 8)
+        .background(Color(nsColor: NSColor(calibratedWhite: 0.13, alpha: 0.98)))
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
     }
 }
 
@@ -1641,7 +1865,7 @@ struct AIAgentPanel: View {
             }
             .padding(10)
         }
-        .background(Color(nsColor: .windowBackgroundColor).opacity(0.96))
+        .background(Surface.chrome)
     }
 
     private func sendDraft() {
@@ -1720,6 +1944,35 @@ struct GeneralSettingsView: View {
                 Toggle("Show hidden files", isOn: $preferences.showHiddenFiles)
             } header: {
                 SettingsSectionHeader(title: "General", subtitle: "Workspace appearance and explorer behavior.")
+            }
+
+            Section {
+                HStack {
+                    Text("Window opacity")
+                    Slider(value: $preferences.windowOpacity, in: 0.5...1.0)
+                    Text("\(Int(preferences.windowOpacity * 100))%")
+                        .font(.system(size: 11, design: .monospaced))
+                        .frame(width: 48, alignment: .trailing)
+                }
+
+                Toggle("Blur what's behind the window", isOn: $preferences.windowBlur)
+                    .disabled(!preferences.isTranslucent)
+                Text(preferences.isTranslucent
+                    ? "Frosts the desktop behind Swiftty instead of showing it sharply."
+                    : "Lower the opacity below 100% to let the desktop show through.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            } header: {
+                Text("Window")
+            }
+
+            Section {
+                Toggle("Compact blocks", isOn: $preferences.compactBlocks)
+                Text("Tightens the spacing between blocks so more fits on screen.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            } header: {
+                Text("Blocks")
             }
 
             Section {
@@ -1986,6 +2239,8 @@ struct TerminalSessionView: NSViewRepresentable {
     @EnvironmentObject private var preferences: AppPreferences
     let tabID: TerminalTab.ID
     let isActive: Bool
+    let wantsFocus: Bool
+    let tracker: BlockTracker
     let onTitle: (String) -> Void
     let onDirectory: (String?) -> Void
     let onExit: (Int32?) -> Void
@@ -1994,16 +2249,16 @@ struct TerminalSessionView: NSViewRepresentable {
         Coordinator(onTitle: onTitle, onDirectory: onDirectory, onExit: onExit)
     }
 
-    func makeNSView(context: Context) -> LocalProcessTerminalView {
-        let terminal = LocalProcessTerminalView(frame: .zero)
+    func makeNSView(context: Context) -> SwifttyTerminalView {
+        let terminal = SwifttyTerminalView(frame: .zero)
         terminal.font = NSFont.monospacedSystemFont(ofSize: preferences.terminalFontSize, weight: .regular)
         terminal.nativeForegroundColor = NSColor(calibratedWhite: 0.92, alpha: 1)
-        terminal.nativeBackgroundColor = NSColor(calibratedWhite: 0.055, alpha: 1)
-        terminal.layer?.backgroundColor = terminal.nativeBackgroundColor.cgColor
         terminal.caretColor = .systemGreen
         terminal.caretViewTracksFocus = true
         terminal.metalBufferingMode = .perFrameAggregated
         try? terminal.setUseMetal(true)
+        // After setUseMetal, so there is an MTKView to make non-opaque.
+        terminal.applyBackground(opacity: preferences.windowOpacity)
         terminal.processDelegate = context.coordinator
         context.coordinator.terminal = terminal
 
@@ -2016,39 +2271,57 @@ struct TerminalSessionView: NSViewRepresentable {
         environment["TERM_PROGRAM"] = "Swiftty"
         environment["TERM_PROGRAM_VERSION"] = "0.1"
 
+        // Load the OSC 133 hooks that command blocks are built on. Shells we
+        // cannot instrument just start normally and produce no blocks.
+        var arguments = ["-l"]
+        var execName = "-" + (shell as NSString).lastPathComponent
+        if let injection = ShellIntegration.prepare(shellPath: shell, tabID: tabID) {
+            environment.merge(injection.environment) { _, new in new }
+            if !injection.arguments.isEmpty { arguments = injection.arguments }
+            if let name = injection.execName { execName = name }
+        }
+
+        // The tracker has to be listening before the shell's first prompt, so
+        // register the OSC handler ahead of startProcess.
+        tracker.attach(to: terminal)
+
         terminal.startProcess(
             executable: shell,
-            args: ["-l"],
+            args: arguments,
             environment: environment.map { $0.key + "=" + $0.value },
-            execName: "-" + (shell as NSString).lastPathComponent,
+            execName: execName,
             currentDirectory: ShellInfo.homePath
         )
 
         DispatchQueue.main.async {
-            guard isActive else { return }
+            guard isActive, wantsFocus else { return }
             terminal.window?.makeFirstResponder(terminal)
         }
         return terminal
     }
 
-    func updateNSView(_ terminal: LocalProcessTerminalView, context: Context) {
+    func updateNSView(_ terminal: SwifttyTerminalView, context: Context) {
         context.coordinator.onTitle = onTitle
         context.coordinator.onDirectory = onDirectory
         context.coordinator.onExit = onExit
         terminal.font = NSFont.monospacedSystemFont(ofSize: preferences.terminalFontSize, weight: .regular)
+        terminal.applyBackground(opacity: preferences.windowOpacity)
 
-        guard isActive else { return }
+        guard isActive, wantsFocus else { return }
         DispatchQueue.main.async {
+            // Only claim focus if something else has not already taken it, or
+            // this would fight the editor for the keyboard every redraw.
+            guard terminal.window?.firstResponder !== terminal else { return }
             terminal.window?.makeFirstResponder(terminal)
         }
     }
 
-    static func dismantleNSView(_ terminal: LocalProcessTerminalView, coordinator: Coordinator) {
+    static func dismantleNSView(_ terminal: SwifttyTerminalView, coordinator: Coordinator) {
         terminal.terminate()
     }
 
     final class Coordinator: NSObject, LocalProcessTerminalViewDelegate {
-        weak var terminal: LocalProcessTerminalView?
+        weak var terminal: SwifttyTerminalView?
         var onTitle: (String) -> Void
         var onDirectory: (String?) -> Void
         var onExit: (Int32?) -> Void
