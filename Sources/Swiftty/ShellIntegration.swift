@@ -63,6 +63,58 @@ enum ShellIntegration {
         }
     }
 
+    // MARK: - Subshells
+
+    /// The line a user adds to the shell config on a remote host or inside a
+    /// container, so sessions there produce blocks too.
+    ///
+    /// It announces "a shell just finished sourcing its rc file"; Swiftty
+    /// answers by typing `subshellBootstrap` into the session. Nothing has to
+    /// be installed on the far end — the hooks arrive over the connection that
+    /// is already open.
+    static func handshakeSnippet(for flavor: Flavor) -> String {
+        switch flavor {
+        case .zsh:
+            return #"printf '\e]133;S;zsh\a'"#
+        case .bash:
+            return #"printf '\e]133;S;bash\a'"#
+        }
+    }
+
+    /// The hooks, collapsed onto one line so they can be typed into a session
+    /// that has no Swiftty rc file of its own.
+    ///
+    /// This mirrors the rc-file hooks above and has to stay in step with them;
+    /// it is separate because a remote shell can only be fed a single line, and
+    /// collapsing the multi-line version automatically would break on its
+    /// `if`/`fi` blocks.
+    static func subshellBootstrap(for flavor: Flavor) -> String {
+        switch flavor {
+        case .zsh:
+            return [
+                #"__swiftty_mark() { builtin printf '\e]133;%s\a' "$1" }"#,
+                #"__swiftty_hex() { builtin printf '%s' "$1" | command od -An -v -tx1 | command tr -d ' \n' }"#,
+                #"__swiftty_capture_status() { __swiftty_status=$? }"#,
+                #"__swiftty_precmd() { if [[ -n "$__swiftty_running" ]]; then __swiftty_mark "D;${__swiftty_status:-0}"; unset __swiftty_running; fi; __swiftty_mark "P;$(__swiftty_hex "$PWD")"; __swiftty_mark "A" }"#,
+                #"__swiftty_preexec() { __swiftty_running=1; __swiftty_mark "P;$(__swiftty_hex "$PWD")"; __swiftty_mark "E;$(__swiftty_hex "$1")"; __swiftty_mark "C" }"#,
+                #"autoload -Uz add-zsh-hook"#,
+                #"precmd_functions=(__swiftty_capture_status $precmd_functions)"#,
+                #"add-zsh-hook precmd __swiftty_precmd"#,
+                #"add-zsh-hook preexec __swiftty_preexec"#,
+            ].joined(separator: "; ")
+
+        case .bash:
+            return [
+                #"__swiftty_mark() { printf '\e]133;%s\a' "$1"; }"#,
+                #"__swiftty_hex() { printf '%s' "$1" | od -An -v -tx1 | tr -d ' \n'; }"#,
+                #"__swiftty_preexec() { [ -n "$COMP_LINE" ] && return 0; [ -n "$__swiftty_running" ] && return 0; case "$BASH_COMMAND" in __swiftty_*|*__swiftty_precmd*) return 0 ;; esac; __swiftty_running=1; __swiftty_mark "P;$(__swiftty_hex "$PWD")"; __swiftty_mark "E;$(__swiftty_hex "$BASH_COMMAND")"; __swiftty_mark "C"; return 0; }"#,
+                #"__swiftty_precmd() { local s=$?; if [ -n "$__swiftty_running" ]; then __swiftty_mark "D;$s"; unset __swiftty_running; fi; __swiftty_mark "P;$(__swiftty_hex "$PWD")"; __swiftty_mark "A"; }"#,
+                #"PROMPT_COMMAND="__swiftty_precmd${PROMPT_COMMAND:+; $PROMPT_COMMAND}""#,
+                #"trap '__swiftty_preexec' DEBUG"#,
+            ].joined(separator: "; ")
+        }
+    }
+
     /// Removes the per-tab integration directory once its shell has exited.
     static func cleanUp(tabID: UUID) {
         try? FileManager.default.removeItem(at: supportDirectoryURL(tabID: tabID))

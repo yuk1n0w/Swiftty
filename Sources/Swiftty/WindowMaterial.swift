@@ -12,10 +12,13 @@ struct VisualEffectBackground: NSViewRepresentable {
 
     func makeNSView(context: Context) -> NSVisualEffectView {
         let view = NSVisualEffectView()
-        // A light material on purpose: the workspace paints its own dark tint
-        // on top, and a heavy material like .underPageBackground would darken
-        // things twice over and swallow the blur entirely.
+        // `.hudWindow` is translucent, which is the whole point; `.underPage`
+        // and friends are dark but effectively opaque and take the desktop away
+        // entirely. Darkness comes from the tint above and from pinning the
+        // appearance — materials resolve against the system theme, so without
+        // this one a light-mode Mac gets a pale wash.
         view.material = .hudWindow
+        view.appearance = NSAppearance(named: .darkAqua)
         view.blendingMode = .behindWindow
         // Keep frosting even when the window is not focused; a terminal that
         // goes flat the moment you click away reads as a bug.
@@ -97,13 +100,13 @@ struct WindowBackdrop: View {
 enum Surface {
     /// The one dark layer over the blur. Its alpha *is* the window opacity.
     static func tint(_ opacity: Double) -> Color {
-        Color(nsColor: NSColor(calibratedWhite: 0.055, alpha: opacity))
+        Color(nsColor: NSColor(calibratedWhite: 0.03, alpha: opacity))
     }
 
     /// The terminal adds nothing of its own — the backdrop already provides the
     /// darkness, and painting again here is what made the window opaque.
     static func terminal(_ opacity: Double) -> NSColor {
-        opacity < 0.99 ? .clear : NSColor(calibratedWhite: 0.055, alpha: 1)
+        opacity < 0.99 ? .clear : NSColor(calibratedWhite: 0.03, alpha: 1)
     }
 
     /// Chrome (toolbars, sidebar, status bar) lifts slightly off the terminal

@@ -1967,6 +1967,24 @@ struct GeneralSettingsView: View {
             }
 
             Section {
+                Text("Blocks work over SSH and inside containers once the remote shell announces itself. Add one line to the shell config **on the remote host** — nothing is installed there, and Swiftty sends the hooks over the connection you already have.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                SnippetRow(
+                    label: "zsh — add to ~/.zshrc",
+                    snippet: ShellIntegration.handshakeSnippet(for: .zsh)
+                )
+                SnippetRow(
+                    label: "bash — add to ~/.bashrc",
+                    snippet: ShellIntegration.handshakeSnippet(for: .bash)
+                )
+            } header: {
+                Text("Remote sessions")
+            }
+
+            Section {
                 Toggle("Compact blocks", isOn: $preferences.compactBlocks)
                 Text("Tightens the spacing between blocks so more fits on screen.")
                     .font(.system(size: 11))
@@ -2216,6 +2234,46 @@ struct AboutSettingsView: View {
                 .foregroundStyle(.tertiary)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+/// A copyable one-liner for the user to paste into a remote shell config.
+struct SnippetRow: View {
+    let label: String
+    let snippet: String
+
+    @State private var copied = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(label)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.secondary)
+
+            HStack(spacing: 8) {
+                Text(snippet)
+                    .font(.system(size: 11, design: .monospaced))
+                    .textSelection(.enabled)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+
+                Spacer(minLength: 4)
+
+                Button(copied ? "Copied" : "Copy") {
+                    Pasteboard.copy(snippet)
+                    copied = true
+                    Task {
+                        try? await Task.sleep(for: .seconds(1.5))
+                        copied = false
+                    }
+                }
+                .controlSize(.small)
+            }
+            .padding(.horizontal, 9)
+            .padding(.vertical, 6)
+            .background(Color.white.opacity(0.05))
+            .clipShape(RoundedRectangle(cornerRadius: 6))
+        }
     }
 }
 

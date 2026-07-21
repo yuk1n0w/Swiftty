@@ -71,6 +71,19 @@ themes, completion, history and full-screen programs behave exactly as they do
 in any other terminal. Shells other than zsh and bash run uninstrumented: the
 terminal works, there are simply no blocks.
 
+## Remote sessions
+
+Blocks keep working over SSH and inside containers, without installing anything
+on the far end. The remote shell config prints one line — a `133;S` marker
+naming its shell — and Swiftty answers by typing the hook definitions into the
+session that is already open. The remote shell then emits the same markers the
+local one does, so its commands become blocks. Settings → General has the
+snippet to copy.
+
+The command that opened the subshell (`ssh host`) never returns to a local
+prompt, so the handshake also closes out its block; otherwise it would sit
+"running" for the whole session and keep the composer off screen.
+
 `BlockTracker` captures a block's output as styled text when the command
 finishes, then clears the terminal buffer at the *next* prompt marker rather
 than at the finish marker — clearing at the finish would wipe the fresh prompt

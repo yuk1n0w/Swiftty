@@ -20,6 +20,8 @@ struct CommandEditor: NSViewRepresentable {
     var onHistory: (Int) -> Void
     var onAcceptSuggestion: () -> Void
     var onEscape: () -> Void
+    /// Bumped to pull the caret back here from wherever it went.
+    var focusRequests: Int
     /// Expands the token under the caret; returns the new text and caret.
     var onComplete: (String, Int) -> (String, Int)?
     var onHeightChange: (CGFloat) -> Void
@@ -53,7 +55,17 @@ struct CommandEditor: NSViewRepresentable {
     func updateNSView(_ view: CommandTextView, context: Context) {
         context.coordinator.parent = self
         view.font = .monospacedSystemFont(ofSize: fontSize, weight: .regular)
-        view.claimFocusFromTerminal()
+
+        // An explicit request wins outright — it means something that had the
+        // keyboard, the find bar say, has just gone away and the caret belongs
+        // back here. `claimFocusFromTerminal` deliberately will not take focus
+        // from another text field, so it cannot cover that case on its own.
+        if focusRequests != context.coordinator.lastFocusRequest {
+            context.coordinator.lastFocusRequest = focusRequests
+            DispatchQueue.main.async { view.window?.makeFirstResponder(view) }
+        } else {
+            view.claimFocusFromTerminal()
+        }
 
         if view.string != text {
             view.string = text
@@ -77,6 +89,7 @@ struct CommandEditor: NSViewRepresentable {
     final class Coordinator: NSObject, NSTextViewDelegate, CommandTextViewDelegate {
         var parent: CommandEditor
         var lastReportedHeight: CGFloat = 0
+        var lastFocusRequest = 0
 
         init(_ parent: CommandEditor) { self.parent = parent }
 

@@ -126,6 +126,9 @@ final class BlockTracker: ObservableObject {
     @Published private(set) var isIntegrationActive = false
     /// True while a full-screen program (vim, htop, less) owns the screen.
     @Published private(set) var isAlternateScreen = false
+    /// Set while a subshell — an SSH session, a container — is producing
+    /// blocks of its own, and labelled with the shell that answered.
+    @Published private(set) var subshell: String?
     /// True between submitting a command and the shell reporting it started.
     ///
     /// The editor has to come off screen for this window, short as it is. It
@@ -381,6 +384,8 @@ final class BlockTracker: ObservableObject {
         let argument = separator.map { String(payload[payload.index(after: $0)...]) }
 
         switch kind {
+        case "S":
+            adoptSubshell(named: argument)
         case "P":
             if let directory = argument.flatMap(Self.decodeHex),
                !directory.isEmpty,
@@ -399,6 +404,29 @@ final class BlockTracker: ObservableObject {
         default:
             break
         }
+    }
+
+    /// `S` arrives from a shell that has just sourced its rc file somewhere we
+    /// do not control — over SSH, or inside a container.
+    ///
+    /// Nothing is installed on the far end. The hooks are typed into the
+    /// session that is already open, so the remote shell starts emitting the
+    /// same markers the local one does and its commands become blocks. The
+    /// echoed setup line is cleaned up by the reset on the next prompt.
+    private func adoptSubshell(named argument: String?) {
+        let name = (argument?.isEmpty == false ? argument! : "sh")
+        guard let flavor = ShellIntegration.Flavor(shellPath: name),
+              let view = terminalView else { return }
+
+        subshell = name
+        // The command that opened the subshell — `ssh host` — never returns to
+        // a local prompt, so its block would otherwise stay running forever and
+        // hold the composer off screen for the whole session.
+        runningBlock = nil
+        isSubmitting = false
+
+        // Leading space so shells with HIST_IGNORE_SPACE keep it out of history.
+        view.send(txt: " " + ShellIntegration.subshellBootstrap(for: flavor) + "\n")
     }
 
     /// `A` arrives from precmd, before the prompt is printed.
@@ -459,6 +487,7 @@ final class BlockTracker: ObservableObject {
 
     /// Closes out a running command when the shell exits without a `D` marker.
     func shellExited() {
+        subshell = nil
         guard var block = runningBlock else { return }
         runningBlock = nil
 

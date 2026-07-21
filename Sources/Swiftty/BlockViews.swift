@@ -118,6 +118,7 @@ private enum BlockStyle {
     static let hint = SwiftUI.Color(white: 0.45)
     static let chipText = SwiftUI.Color(white: 0.78)
     static let searchRing = SwiftUI.Color(red: 0.98, green: 0.78, blue: 0.35).opacity(0.7)
+    static let promptRemote = SwiftUI.Color(red: 0.55, green: 0.85, blue: 0.98)
 
     static func background(
         _ state: CommandBlock.State,
@@ -199,6 +200,8 @@ struct BlockStack<Terminal: View>: View {
     @State private var stashedDraft = ""
     /// The history palette is open while the arrow keys are browsing.
     @State private var historyOpen = false
+    /// Bumped whenever the caret should return to the command editor.
+    @State private var editorFocusRequests = 0
 
     /// Blocks only make sense while the shell is at a prompt: there is nothing
     /// to show before the integration loads, and a full-screen program like vim
@@ -240,6 +243,18 @@ struct BlockStack<Terminal: View>: View {
                     findBar
                         .transition(.move(edge: .top).combined(with: .opacity))
                 }
+            }
+            // Closing the find bar, or a command finishing, hands the caret
+            // back to the editor — it is where typing goes, so it should never
+            // be left without focus.
+            .onChange(of: store.searchVisible) { _, visible in
+                if !visible { editorFocusRequests += 1 }
+            }
+            .onChange(of: tracker.runningBlock?.id) { _, running in
+                if running == nil { editorFocusRequests += 1 }
+            }
+            .onChange(of: tracker.isSubmitting) { _, submitting in
+                if !submitting { editorFocusRequests += 1 }
             }
             .animation(.easeOut(duration: 0.2), value: store.searchVisible)
             .animation(.easeOut(duration: 0.2), value: tracker.runningBlock?.id)
@@ -415,6 +430,7 @@ struct BlockStack<Terminal: View>: View {
                         onHistory: walkHistory,
                         onAcceptSuggestion: { draft += suggestion },
                         onEscape: dismissHistory,
+                        focusRequests: editorFocusRequests,
                         onComplete: completeToken,
                         onHeightChange: { editorHeight = $0 }
                     )
@@ -472,7 +488,14 @@ struct BlockStack<Terminal: View>: View {
     /// Where the command will run: which shell, which directory, which branch.
     private var contextChips: some View {
         HStack(spacing: 7) {
-            chip("terminal", shellName)
+            if let subshell = tracker.subshell {
+                // Standing in for the shell chip: while a subshell is driving,
+                // the local shell is not what these commands run in.
+                chip("link", subshell)
+                    .foregroundStyle(BlockStyle.promptRemote)
+            } else {
+                chip("terminal", shellName)
+            }
             chip("folder", tracker.directoryLabel)
             if let branch = tracker.gitBranch, !branch.isEmpty {
                 chip("arrow.triangle.branch", branch)
@@ -605,6 +628,18 @@ struct BlockStack<Terminal: View>: View {
                     findBar
                         .transition(.move(edge: .top).combined(with: .opacity))
                 }
+            }
+            // Closing the find bar, or a command finishing, hands the caret
+            // back to the editor — it is where typing goes, so it should never
+            // be left without focus.
+            .onChange(of: store.searchVisible) { _, visible in
+                if !visible { editorFocusRequests += 1 }
+            }
+            .onChange(of: tracker.runningBlock?.id) { _, running in
+                if running == nil { editorFocusRequests += 1 }
+            }
+            .onChange(of: tracker.isSubmitting) { _, submitting in
+                if !submitting { editorFocusRequests += 1 }
             }
             .animation(.easeOut(duration: 0.2), value: store.searchVisible)
             .animation(.easeOut(duration: 0.2), value: tracker.runningBlock?.id)
