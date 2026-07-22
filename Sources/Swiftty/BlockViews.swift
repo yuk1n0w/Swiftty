@@ -233,7 +233,7 @@ struct BlockStack<Terminal: View>: View {
                 // composer floats over the blocks instead of sitting in a slot
                 // of its own, and a slot with any height would show its own
                 // full-width background as a band beneath the card.
-                liveBlock
+                liveBlock(viewport: proxy.size.height)
                     .frame(height: showsBlocks
                         ? (tracker.runningBlock == nil ? 0 : runningHeight(viewport: proxy.size.height))
                         : nil)
@@ -747,7 +747,7 @@ struct BlockStack<Terminal: View>: View {
     ///
     /// Collapses to nothing at a prompt, but the terminal is never removed from
     /// the hierarchy — destroying it would take its shell with it.
-    private var liveBlock: some View {
+    private func liveBlock(viewport: CGFloat) -> some View {
         let isRunning = tracker.runningBlock != nil
 
         return VStack(alignment: .leading, spacing: 0) {
@@ -783,10 +783,25 @@ struct BlockStack<Terminal: View>: View {
                 .padding(.bottom, 4)
             }
 
-            terminal
-                .opacity(isRunning || !showsBlocks ? 1 : 0)
-                .allowsHitTesting(isRunning || !showsBlocks)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            // The terminal keeps one size no matter what the slot around it is
+            // doing. It lives in an overlay, which unlike a child never
+            // proposes its height back to the layout, so the slot can collapse
+            // to nothing at a prompt while the pty stays exactly as tall.
+            //
+            // Letting it collapse resized the pty, and a program that draws
+            // then repositions its cursor — fastfetch placing text beside its
+            // logo — comes out mangled if it starts before the terminal has
+            // grown back. Over SSH that race is lost routinely, because the
+            // size change has to reach the far end before the program reads it.
+            Color.clear
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .overlay(alignment: .topLeading) {
+                    terminal
+                        .frame(height: showsBlocks ? runningHeight(viewport: viewport) : nil)
+                        .opacity(isRunning || !showsBlocks ? 1 : 0)
+                        .allowsHitTesting(isRunning || !showsBlocks)
+                }
+                .clipped()
         }
         .clipped()
     }

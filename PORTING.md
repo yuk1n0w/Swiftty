@@ -92,12 +92,16 @@ prompt, so adoption also closes out its block; otherwise it would sit "running"
 for the whole session and keep the composer off screen.
 
 Tab completion and the file explorer follow the session onto the remote host.
-The bootstrap carries an `__swiftty_ls` helper that reports a directory back as
-an `L` marker, so both read the far end's filesystem rather than the local disk,
-which merely happens to have paths that resolve. Those queries are filtered out
-of the block stream by the same preexec guard, so they never appear as commands.
-Command-name completion is suppressed while remote, since the local `PATH` says
-nothing about what is installed there.
+The bootstrap carries an `__swiftty_ls` helper that reports a directory as an
+`L` marker; the far end's `precmd` calls it for `$PWD` on every prompt, so the
+explorer always has the current directory without asking. Completion of other
+paths asks on demand, and a lost query (sent before `__swiftty_ls` was defined
+on a slow link) times out so a later request retries rather than the path
+staying stuck. These queries are filtered out of the block stream by the same
+preexec guard, so they never appear as commands. Command-name completion is
+suppressed while remote, since the local `PATH` says nothing about what is
+installed there. Tilde-relative completion (`~/…`) still resolves against the
+local home and is a known gap.
 
 `BlockTracker` captures a block's output as styled text when the command
 finishes, then clears the terminal buffer at the *next* prompt marker rather

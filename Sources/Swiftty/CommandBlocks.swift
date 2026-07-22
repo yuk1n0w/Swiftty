@@ -402,7 +402,8 @@ final class BlockTracker: ObservableObject {
                directory != currentDirectory {
                 currentDirectory = directory
                 refreshGitBranch(for: directory)
-                if subshell != nil { requestRemoteListing(directory) }
+                // The cwd listing arrives on its own from precmd; no need to
+                // ask for it and double up the query.
             }
         case "A":
             beginPrompt()
@@ -428,6 +429,19 @@ final class BlockTracker: ObservableObject {
         pendingListings.insert(path)
         let quoted = path.replacingOccurrences(of: "'", with: "'\\''")
         view.send(txt: " __swiftty_ls '\(quoted)'\n")
+
+        // A query can be lost — sent before `__swiftty_ls` was defined on a
+        // slow link, or dropped in a busy session. Without this the path would
+        // sit in `pendingListings` forever and never be asked for again, which
+        // is why completion would work once and then go dead. Time it out so a
+        // later request retries.
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(3))
+            guard let self else { return }
+            if self.remoteListings[path] == nil {
+                self.pendingListings.remove(path)
+            }
+        }
     }
 
     /// Entries the far end reported for `path`, if it has answered yet.
