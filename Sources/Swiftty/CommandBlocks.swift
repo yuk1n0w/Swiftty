@@ -160,6 +160,10 @@ final class BlockTracker: ObservableObject {
     private var promptRow = 0
     /// Absolute row the running command's output starts on.
     private var outputStartRow: Int?
+    /// Unbalanced command starts. `ssh host` opens one that stays open for the
+    /// whole remote session; remote commands balance their own. Back to zero
+    /// means the local prompt.
+    private var commandDepth = 0
 
     /// Cap on both retained blocks and captured lines per block, so a runaway
     /// command cannot grow the model without bound.
@@ -599,6 +603,7 @@ final class BlockTracker: ObservableObject {
     private func beginOutput() {
         isSubmitting = false
         focusTerminal()
+        commandDepth += 1
         watchForSubshell(command: pendingCommand ?? "")
 
         let row = outputBoundaryRow() ?? promptRow
@@ -616,9 +621,14 @@ final class BlockTracker: ObservableObject {
     /// `D` arrives from the next precmd, after the output and before the next
     /// prompt is drawn.
     private func endCommand(exitCode: Int32) {
-        // A local command finished, so we are back at the local prompt.
         subshellWatch?.cancel()
-        if subshell != nil {
+        commandDepth = max(0, commandDepth - 1)
+
+        // The subshell ends only when the command that opened it -- the `ssh`
+        // itself -- finishes and depth returns to zero. A command finishing
+        // *inside* the session, a remote `cd` above all, emits its own D marker
+        // but leaves depth >= 1, and must not flip the explorer back to local.
+        if commandDepth == 0, subshell != nil {
             subshell = nil
             remoteListings.removeAll()
             pendingListings.removeAll()
@@ -648,6 +658,7 @@ final class BlockTracker: ObservableObject {
 
     /// Closes out a running command when the shell exits without a `D` marker.
     func shellExited() {
+        commandDepth = 0
         subshell = nil
         guard var block = runningBlock else { return }
         runningBlock = nil
