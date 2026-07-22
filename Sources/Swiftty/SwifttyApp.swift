@@ -885,6 +885,17 @@ final class TerminalStore: ObservableObject {
     func markExited(for tabID: TerminalTab.ID, code: Int32?) {
         guard let index = tabs.firstIndex(where: { $0.id == tabID }) else { return }
         tabs[index].exitCode = code
+
+        // A shell that exited is a dead tab — `exit` should close it the way it
+        // would in any terminal. Only the *local* shell process ending reaches
+        // here; exiting an SSH session returns to the local shell and never
+        // terminates it.
+        if tabs.count > 1 {
+            close(tabID)
+        } else {
+            // The last tab: close the window, which quits the app.
+            NSApp.keyWindow?.close()
+        }
     }
 }
 

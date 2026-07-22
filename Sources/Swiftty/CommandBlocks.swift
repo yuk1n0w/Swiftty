@@ -152,6 +152,9 @@ final class BlockTracker: ObservableObject {
     /// answers these instead.
     @Published private(set) var remoteListings: [String: [String]] = [:]
     private var pendingListings: Set<String> = []
+    /// The local working directory captured on entering a subshell, restored on
+    /// leaving it.
+    private var localDirectory: String?
     private var subshellWatch: Task<Void, Never>?
     private var gitBranchCache: [String: String?] = [:]
     private weak var terminalView: SwifttyTerminalView?
@@ -554,6 +557,7 @@ final class BlockTracker: ObservableObject {
     /// Types the hooks into whatever shell is on the other end.
     private func installSubshellHooks(named name: String? = nil) {
         guard let view = terminalView else { return }
+        if subshell == nil { localDirectory = currentDirectory }
         remoteListings.removeAll()
         pendingListings.removeAll()
         subshell = name ?? "ssh"
@@ -629,6 +633,11 @@ final class BlockTracker: ObservableObject {
         // *inside* the session, a remote `cd` above all, emits its own D marker
         // but leaves depth >= 1, and must not flip the explorer back to local.
         if commandDepth == 0, subshell != nil {
+            if let localDirectory {
+                currentDirectory = localDirectory
+                refreshGitBranch(for: localDirectory)
+            }
+            localDirectory = nil
             subshell = nil
             remoteListings.removeAll()
             pendingListings.removeAll()
