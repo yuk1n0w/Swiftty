@@ -35,6 +35,14 @@ swift build --disable-sandbox
 open build/Swiftty.app
 ```
 
+The bundle is self-contained: `build-app.sh` compiles SwiftTerm's Metal shaders
+into `Contents/Resources/default.metallib`. SwiftTerm loads shaders via
+`device.makeDefaultLibrary()` first and only falls back to `Bundle.module` — whose
+generated accessor checks the .app root and a hardcoded absolute `.build` path,
+then `fatalError`s — if that fails. Without the metallib the app ran only on the
+build machine (whose `.build` still held the resource bundle) and crashed on
+launch anywhere else the moment Metal was enabled.
+
 The app is deliberately unsandboxed while it owns local shells. A sandboxed target would need explicit security-scoped access and would not behave like the current terminal.
 
 ## Command blocks
