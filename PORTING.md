@@ -45,6 +45,14 @@ launch anywhere else the moment Metal was enabled.
 
 The app is deliberately unsandboxed while it owns local shells. A sandboxed target would need explicit security-scoped access and would not behave like the current terminal.
 
+## Tab groups
+
+The label left of the tab strip is a group selector: tabs live in named groups,
+and one window can hold several. Switching groups swaps which set of tabs is on
+screen but mounts *all* tabs from *all* groups at once (only the active one
+visible), so a switch never tears a terminal down and kills its shell. `⇧⌘T`
+makes a group, `⇧⌘[`/`⇧⌘]` cycle them, and the menu renames or closes one.
+
 ## Command blocks
 
 The terminal surface is a stack of blocks, one per command, in the style of

@@ -685,6 +685,17 @@ struct SwifttyApp: App {
                 }
                 .keyboardShortcut("w", modifiers: .command)
 
+                Divider()
+
+                Button("New Group") { store.newGroup() }
+                    .keyboardShortcut("t", modifiers: [.command, .shift])
+                Button("Next Group") { store.selectRelativeGroup(by: 1) }
+                    .keyboardShortcut("]", modifiers: [.command, .shift])
+                    .disabled(store.groups.count < 2)
+                Button("Previous Group") { store.selectRelativeGroup(by: -1) }
+                    .keyboardShortcut("[", modifiers: [.command, .shift])
+                    .disabled(store.groups.count < 2)
+
                 Button("Toggle AI Agent") {
                     store.toggleAIPanel()
                 }
@@ -737,8 +748,12 @@ struct SwifttyApp: App {
 
 @MainActor
 final class TerminalStore: ObservableObject {
-    @Published private(set) var tabs: [TerminalTab] = [.init()]
-    @Published private(set) var activeTabID: TerminalTab.ID
+    /// Tabs are organised into named groups. Every group keeps its own tabs and
+    /// its own active tab, and switching groups only changes which is on screen
+    /// — every tab across every group stays mounted so no shell is ever killed
+    /// by a group switch.
+    @Published private(set) var groups: [TabGroup]
+    @Published private(set) var activeGroupID: TabGroup.ID
     @Published var sidebarVisible = true
     @Published var aiPanelVisible = false
     /// Filters the block history. Empty shows everything.
@@ -764,38 +779,121 @@ final class TerminalStore: ObservableObject {
     init(preferences: AppPreferences) {
         self.preferences = preferences
         let initialTab = TerminalTab()
-        tabs = [initialTab]
-        activeTabID = initialTab.id
+        let group = TabGroup(name: "Default", tabs: [initialTab], activeTabID: initialTab.id)
+        groups = [group]
+        activeGroupID = group.id
         blockTrackers[initialTab.id] = BlockTracker()
     }
+
+    // MARK: - Tabs (scoped to the active group)
+
+    /// Tabs of the group currently on screen. The tab strip shows these.
+    var tabs: [TerminalTab] { activeGroup?.tabs ?? [] }
+
+    /// The tab currently on screen — the active group's active tab.
+    var activeTabID: TerminalTab.ID { activeGroup?.activeTabID ?? UUID() }
+
+    /// Every tab across every group. The workspace mounts all of these so a
+    /// group switch never tears a terminal (and its shell) down.
+    var allTabs: [TerminalTab] { groups.flatMap(\.tabs) }
 
     var activeTab: TerminalTab? {
         tabs.first { $0.id == activeTabID }
     }
 
+    private var activeGroup: TabGroup? {
+        groups.first { $0.id == activeGroupID }
+    }
+
+    private func mutateActiveGroup(_ body: (inout TabGroup) -> Void) {
+        guard let index = groups.firstIndex(where: { $0.id == activeGroupID }) else { return }
+        body(&groups[index])
+    }
+
+    /// Mutates the tab with `id`, wherever it lives.
+    private func withTab(_ id: TerminalTab.ID, _ body: (inout TerminalTab) -> Void) {
+        for groupIndex in groups.indices {
+            if let tabIndex = groups[groupIndex].tabs.firstIndex(where: { $0.id == id }) {
+                body(&groups[groupIndex].tabs[tabIndex])
+                return
+            }
+        }
+    }
+
     func newTab() {
         let tab = TerminalTab()
         blockTrackers[tab.id] = BlockTracker()
-        tabs.append(tab)
-        activeTabID = tab.id
+        mutateActiveGroup {
+            $0.tabs.append(tab)
+            $0.activeTabID = tab.id
+        }
     }
 
     func select(_ tabID: TerminalTab.ID) {
         guard tabs.contains(where: { $0.id == tabID }) else { return }
-        activeTabID = tabID
+        mutateActiveGroup { $0.activeTabID = tabID }
     }
 
-    /// Cycles tabs, wrapping at either end.
+    /// Cycles tabs within the active group, wrapping at either end.
     func selectRelativeTab(by offset: Int) {
+        let tabs = self.tabs
         guard tabs.count > 1,
               let current = tabs.firstIndex(where: { $0.id == activeTabID }) else { return }
         let next = (current + offset + tabs.count) % tabs.count
-        activeTabID = tabs[next].id
+        mutateActiveGroup { $0.activeTabID = tabs[next].id }
     }
 
     func select(index: Int) {
         guard tabs.indices.contains(index) else { return }
-        activeTabID = tabs[index].id
+        let id = tabs[index].id
+        mutateActiveGroup { $0.activeTabID = id }
+    }
+
+    // MARK: - Groups
+
+    var activeGroupName: String { activeGroup?.name ?? "Default" }
+
+    func newGroup() {
+        let tab = TerminalTab()
+        blockTrackers[tab.id] = BlockTracker()
+        let group = TabGroup(
+            name: "Group \(groups.count + 1)",
+            tabs: [tab],
+            activeTabID: tab.id
+        )
+        groups.append(group)
+        activeGroupID = group.id
+    }
+
+    func selectGroup(_ id: TabGroup.ID) {
+        guard groups.contains(where: { $0.id == id }) else { return }
+        activeGroupID = id
+    }
+
+    /// Cycles groups, wrapping at either end.
+    func selectRelativeGroup(by offset: Int) {
+        guard groups.count > 1,
+              let current = groups.firstIndex(where: { $0.id == activeGroupID }) else { return }
+        activeGroupID = groups[(current + offset + groups.count) % groups.count].id
+    }
+
+    func renameGroup(_ id: TabGroup.ID, to name: String) {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, let index = groups.firstIndex(where: { $0.id == id }) else { return }
+        groups[index].name = trimmed
+    }
+
+    /// Closes a whole group and every shell in it. The last group is kept.
+    func closeGroup(_ id: TabGroup.ID) {
+        guard groups.count > 1, let index = groups.firstIndex(where: { $0.id == id }) else { return }
+        for tab in groups[index].tabs {
+            blockTrackers.removeValue(forKey: tab.id)
+            ShellIntegration.cleanUp(tabID: tab.id)
+        }
+        groups.remove(at: index)
+        if activeGroupID == id {
+            activeGroupID = groups[min(index, groups.count - 1)].id
+        }
     }
 
     func beginSearch() {
@@ -894,45 +992,69 @@ final class TerminalStore: ObservableObject {
         close(activeTabID)
     }
 
+    /// Closes one tab, wherever it lives. Empties its group when it was the
+    /// last tab there; closes the window when it was the last tab anywhere.
     func close(_ tabID: TerminalTab.ID) {
-        guard tabs.count > 1, let index = tabs.firstIndex(where: { $0.id == tabID }) else {
+        let total = groups.reduce(0) { $0 + $1.tabs.count }
+        guard total > 1 else {
+            // The last tab across every group: close the window, which quits.
+            NSApp.keyWindow?.close()
+            return
+        }
+        guard let groupIndex = groups.firstIndex(where: { $0.tabs.contains { $0.id == tabID } }),
+              let tabIndex = groups[groupIndex].tabs.firstIndex(where: { $0.id == tabID }) else {
             return
         }
 
-        let closingID = tabs[index].id
-        tabs.remove(at: index)
-        blockTrackers.removeValue(forKey: closingID)
-        ShellIntegration.cleanUp(tabID: closingID)
-        guard closingID == activeTabID else { return }
-        activeTabID = tabs[min(index, tabs.count - 1)].id
+        groups[groupIndex].tabs.remove(at: tabIndex)
+        blockTrackers.removeValue(forKey: tabID)
+        ShellIntegration.cleanUp(tabID: tabID)
+
+        if groups[groupIndex].tabs.isEmpty {
+            let closingGroupID = groups[groupIndex].id
+            groups.remove(at: groupIndex)
+            if activeGroupID == closingGroupID {
+                activeGroupID = groups[min(groupIndex, groups.count - 1)].id
+            }
+        } else if groups[groupIndex].activeTabID == tabID {
+            let fallback = groups[groupIndex].tabs[min(tabIndex, groups[groupIndex].tabs.count - 1)]
+            groups[groupIndex].activeTabID = fallback.id
+        }
     }
 
     func updateTitle(_ title: String, for tabID: TerminalTab.ID) {
-        guard let index = tabs.firstIndex(where: { $0.id == tabID }) else { return }
         let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        tabs[index].title = trimmed
+        withTab(tabID) { $0.title = trimmed }
     }
 
     func updateDirectory(_ directory: String?, for tabID: TerminalTab.ID) {
-        guard let index = tabs.firstIndex(where: { $0.id == tabID }) else { return }
-        tabs[index].directory = directory
+        withTab(tabID) { $0.directory = directory }
     }
 
     func markExited(for tabID: TerminalTab.ID, code: Int32?) {
-        guard let index = tabs.firstIndex(where: { $0.id == tabID }) else { return }
-        tabs[index].exitCode = code
-
+        withTab(tabID) { $0.exitCode = code }
         // A shell that exited is a dead tab — `exit` should close it the way it
-        // would in any terminal. Only the *local* shell process ending reaches
-        // here; exiting an SSH session returns to the local shell and never
-        // terminates it.
-        if tabs.count > 1 {
-            close(tabID)
-        } else {
-            // The last tab: close the window, which quits the app.
-            NSApp.keyWindow?.close()
-        }
+        // would in any terminal. `close` closes the window if it was the last
+        // tab anywhere. Only the *local* shell process ending reaches here;
+        // exiting an SSH session returns to the local shell, never terminates it.
+        close(tabID)
+    }
+}
+
+/// A named set of tabs. Groups let one window hold several independent sets of
+/// terminals — a project's tabs kept apart from a server's, say.
+struct TabGroup: Identifiable, Equatable {
+    let id: UUID
+    var name: String
+    var tabs: [TerminalTab]
+    var activeTabID: TerminalTab.ID
+
+    init(id: UUID = UUID(), name: String, tabs: [TerminalTab], activeTabID: TerminalTab.ID) {
+        self.id = id
+        self.name = name
+        self.tabs = tabs
+        self.activeTabID = activeTabID
     }
 }
 
@@ -1025,15 +1147,7 @@ struct WorkspaceChrome: View {
                 .background(Color.white.opacity(0.06))
                 .clipShape(Capsule())
 
-                HStack(spacing: 5) {
-                    Text("Default")
-                    Image(systemName: "chevron.right")
-                        .font(.system(size: 9, weight: .semibold))
-                        .foregroundStyle(.tertiary)
-                }
-                .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 4)
+                TabGroupMenu()
 
                 TerminalTabStrip()
 
@@ -1136,6 +1250,70 @@ struct ChromeButton: View {
 }
 
 
+/// The group selector that replaced the old static "Default" label: it names
+/// the current group and drops a menu to switch, add, rename, or close groups.
+struct TabGroupMenu: View {
+    @EnvironmentObject private var store: TerminalStore
+
+    var body: some View {
+        Menu {
+            ForEach(store.groups) { group in
+                Button {
+                    store.selectGroup(group.id)
+                } label: {
+                    // A leading checkmark marks the active group. It reads as a
+                    // radio list rather than plain items.
+                    Label(
+                        "\(group.name)  ·  \(group.tabs.count) tab\(group.tabs.count == 1 ? "" : "s")",
+                        systemImage: group.id == store.activeGroupID ? "checkmark" : "square.stack"
+                    )
+                }
+            }
+
+            Divider()
+
+            Button("New Group") { store.newGroup() }
+            Button("Rename Group…") { presentRename(for: store.activeGroupID) }
+            if store.groups.count > 1 {
+                Button("Close Group", role: .destructive) {
+                    store.closeGroup(store.activeGroupID)
+                }
+            }
+        } label: {
+            HStack(spacing: 5) {
+                Text(store.activeGroupName)
+                    .lineLimit(1)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(.tertiary)
+            }
+            .font(.system(size: 12, weight: .medium))
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .contentShape(Rectangle())
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+    }
+
+    private func presentRename(for id: TabGroup.ID) {
+        let alert = NSAlert()
+        alert.messageText = "Rename Group"
+        alert.informativeText = "Give this tab group a name."
+        let field = NSTextField(string: store.activeGroupName)
+        field.frame = NSRect(x: 0, y: 0, width: 240, height: 24)
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Rename")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = field
+        if alert.runModal() == .alertFirstButtonReturn {
+            store.renameGroup(id, to: field.stringValue)
+        }
+    }
+}
+
 struct TerminalTabStrip: View {
     @EnvironmentObject private var store: TerminalStore
 
@@ -1222,7 +1400,11 @@ struct WorkspaceMain: View {
     var body: some View {
         HStack(spacing: 0) {
             ZStack {
-                ForEach(store.tabs) { tab in
+                // Every tab in every group is mounted, so switching groups
+                // never tears a terminal down and kills its shell. Only the
+                // active group's active tab is visible; the rest sit at zero
+                // opacity with hit-testing off.
+                ForEach(store.allTabs) { tab in
                     let tracker = store.blockTracker(for: tab.id)
                     BlockStack(
                         tracker: tracker,
