@@ -387,7 +387,12 @@ final class BlockTracker: ObservableObject {
 
     /// What the tab shows: the running command while one is executing, the
     /// current folder otherwise — the same thing a normal terminal reports.
+    /// A name the user pinned to this tab, if any. Once set it wins over the
+    /// automatic label; clearing it hands the label back to the shell.
+    @Published var customName: String?
+
     var tabLabel: String {
+        if let customName, !customName.isEmpty { return customName }
         if let running = runningBlock,
            let first = running.command.split(separator: " ").first {
             return String(first)
@@ -398,6 +403,9 @@ final class BlockTracker: ObservableObject {
         }
         return name.isEmpty ? currentDirectory : name
     }
+
+    /// True when the tab is showing a name the user set, not the shell's.
+    var hasCustomName: Bool { !(customName ?? "").isEmpty }
 
     /// The working directory, shown on the prompt line above the editor. The
     /// shell draws its own prompt into the terminal, which is hidden while

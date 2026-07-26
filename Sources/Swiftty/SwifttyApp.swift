@@ -1323,7 +1323,8 @@ struct TerminalTabStrip: View {
                 TerminalTabButton(
                     tracker: store.blockTracker(for: tab.id),
                     isActive: tab.id == store.activeTabID,
-                    onSelect: { store.select(tab.id) }
+                    onSelect: { store.select(tab.id) },
+                    onClose: { store.close(tab.id) }
                 )
                 // A new tab grows in from the trailing edge; a closed one
                 // collapses away, so the strip reshuffles smoothly instead of
@@ -1353,13 +1354,12 @@ struct TerminalTabButton: View {
     @ObservedObject var tracker: BlockTracker
     let isActive: Bool
     let onSelect: () -> Void
+    let onClose: () -> Void
 
     var body: some View {
         Button(action: onSelect) {
             HStack(spacing: 7) {
-                Image(systemName: tracker.runningBlock == nil
-                    ? "terminal"
-                    : "circle.dotted")
+                Image(systemName: tracker.runningBlock == nil ? "terminal" : "circle.dotted")
                     .font(.system(size: 12, weight: .medium))
                     .symbolEffect(.pulse, isActive: tracker.runningBlock != nil)
 
@@ -1377,10 +1377,40 @@ struct TerminalTabButton: View {
             Capsule().fill(Color.white.opacity(isActive ? 0.08 : 0))
         )
         .clipShape(Capsule())
+        // Double-click to rename, the way Terminal and iTerm do it. A
+        // simultaneous gesture rather than onTapGesture(count:2), so the
+        // button's single-tap select still fires instantly instead of waiting
+        // to see whether a second click is coming.
+        .simultaneousGesture(TapGesture(count: 2).onEnded { rename() })
+        .contextMenu {
+            Button("Rename…") { rename() }
+            if tracker.hasCustomName {
+                Button("Use Automatic Name") { tracker.customName = nil }
+            }
+            Divider()
+            Button("Close Tab") { onClose() }
+        }
         .accessibilityElement(children: .combine)
         .accessibilityLabel("Terminal tab " + tracker.tabLabel)
         .animation(.easeOut(duration: 0.15), value: tracker.tabLabel)
         .animation(.easeOut(duration: 0.2), value: isActive)
+    }
+
+    private func rename() {
+        let alert = NSAlert()
+        alert.messageText = "Rename Tab"
+        alert.informativeText = "Leave blank to use the automatic name."
+        let field = NSTextField(string: tracker.customName ?? "")
+        field.placeholderString = tracker.tabLabel
+        field.frame = NSRect(x: 0, y: 0, width: 240, height: 24)
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Rename")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = field
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let name = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        tracker.customName = name.isEmpty ? nil : name
     }
 }
 
