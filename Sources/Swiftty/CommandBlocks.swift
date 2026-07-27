@@ -168,6 +168,10 @@ final class BlockTracker: ObservableObject {
         FileManager.default.homeDirectoryForCurrentUser.path
     /// Branch checked out in `currentDirectory`, if any.
     @Published private(set) var gitBranch: String?
+    /// Called with each finished block, so the store can decide whether it is
+    /// worth a notification. The tracker itself has no idea whether its tab is
+    /// on screen — that is the store's call.
+    var onCommandFinished: ((CommandBlock) -> Void)?
     /// Height the live terminal needs while sitting at a prompt.
     @Published private(set) var idleTerminalHeight: CGFloat = 44
 
@@ -703,6 +707,7 @@ final class BlockTracker: ObservableObject {
 
         finish(&block, state: .finished(exitCode: exitCode))
         append(block)
+        onCommandFinished?(blocks.last ?? block)
     }
 
     private static func clearsHistory(_ command: String) -> Bool {

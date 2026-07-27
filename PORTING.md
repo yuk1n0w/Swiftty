@@ -126,6 +126,20 @@ the shell is about to draw. Each block therefore owns its text outright, and the
 live terminal only ever holds the command in progress. A full-screen program
 taking over the alternate screen hands it the whole view until it exits.
 
+## Notifications
+
+The bell in the toolbar raises a notification when a command finishes somewhere
+you were not watching: a long (>=6s) or failed command in a background tab, or
+anything that finishes while the app is hidden. A quick command in the tab you
+are staring at never notifies. The bell badges the unread count; its popover
+lists them and clicking one jumps to that tab, switching group and activating
+the window if need be. When the app is in the background a native banner fires
+too (best-effort, guarded so a build without a bundle id just gets none).
+
+The tracker reports each finished block through `onCommandFinished`; the store
+decides whether it is notification-worthy, since only the store knows which tab
+is on screen and whether the app is frontmost.
+
 ## Performance
 
 Metal rendering runs in `.perRowPersistent` mode: only rows that changed are

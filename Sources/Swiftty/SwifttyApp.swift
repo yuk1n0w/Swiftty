@@ -767,6 +767,18 @@ final class TerminalStore: ObservableObject {
     @Published private(set) var aiMessages: [AIMessage] = []
     @Published private(set) var aiSending = false
 
+    /// Notifications raised when a command finishes in a tab the user was not
+    /// watching, newest first.
+    @Published private(set) var notifications: [SwifttyNotification] = []
+
+    /// Commands shorter than this don't notify — you were probably watching.
+    private static let notifyThreshold: TimeInterval = 6
+    private static let maxNotifications = 100
+
+    var unreadNotificationCount: Int {
+        notifications.reduce(0) { $0 + ($1.isRead ? 0 : 1) }
+    }
+
     /// One block tracker per tab, kept here so the panel and the terminal view
     /// share the same one and it outlives SwiftUI view updates.
     ///
@@ -782,7 +794,20 @@ final class TerminalStore: ObservableObject {
         let group = TabGroup(name: "Default", tabs: [initialTab], activeTabID: initialTab.id)
         groups = [group]
         activeGroupID = group.id
-        blockTrackers[initialTab.id] = BlockTracker()
+        _ = makeTracker(for: initialTab.id)
+    }
+
+    /// Creates a tab's tracker and wires it to raise notifications when a
+    /// command finishes there. Every tracker is born through here so the
+    /// notification hook is never forgotten at a call site.
+    @discardableResult
+    private func makeTracker(for tabID: TerminalTab.ID) -> BlockTracker {
+        let tracker = BlockTracker()
+        tracker.onCommandFinished = { [weak self] block in
+            self?.handleFinishedCommand(block, tabID: tabID)
+        }
+        blockTrackers[tabID] = tracker
+        return tracker
     }
 
     // MARK: - Tabs (scoped to the active group)
@@ -822,7 +847,7 @@ final class TerminalStore: ObservableObject {
 
     func newTab() {
         let tab = TerminalTab()
-        blockTrackers[tab.id] = BlockTracker()
+        makeTracker(for: tab.id)
         mutateActiveGroup {
             $0.tabs.append(tab)
             $0.activeTabID = tab.id
@@ -855,7 +880,7 @@ final class TerminalStore: ObservableObject {
 
     func newGroup() {
         let tab = TerminalTab()
-        blockTrackers[tab.id] = BlockTracker()
+        makeTracker(for: tab.id)
         let group = TabGroup(
             name: "Group \(groups.count + 1)",
             tabs: [tab],
@@ -1040,6 +1065,97 @@ final class TerminalStore: ObservableObject {
         // exiting an SSH session returns to the local shell, never terminates it.
         close(tabID)
     }
+
+    // MARK: - Notifications
+
+    /// Decides whether a just-finished command is worth notifying about.
+    ///
+    /// The point is to tell you about work you *weren't* watching: a long build
+    /// or a failure in a background tab, or anything that finished while the app
+    /// was in the background. A quick command in the tab you are staring at is
+    /// never a notification.
+    private func handleFinishedCommand(_ block: CommandBlock, tabID: TerminalTab.ID) {
+        guard !block.command.isEmpty else { return }
+
+        let failed = (block.state.exitCode ?? 0) != 0
+        let ranLong = (block.duration ?? 0) >= Self.notifyThreshold
+        guard failed || ranLong else { return }
+
+        // Watching means: app frontmost and this is the visible tab. Then you
+        // saw it happen and don't need telling.
+        let watching = NSApplication.shared.isActive && tabID == activeTabID
+        guard !watching else { return }
+
+        let note = SwifttyNotification(
+            command: block.command,
+            detail: failed
+                ? "failed" + (block.state.exitCode.map { " (exit \($0))" } ?? "")
+                : "finished" + (block.durationLabel.map { " in \($0)" } ?? ""),
+            date: block.finishedAt ?? Date(),
+            tabID: tabID,
+            groupName: groups.first { $0.tabs.contains { $0.id == tabID } }?.name ?? "",
+            isError: failed
+        )
+        notifications.insert(note, at: 0)
+        if notifications.count > Self.maxNotifications {
+            notifications.removeLast(notifications.count - Self.maxNotifications)
+        }
+
+        // A native banner only when the app is in the background — in the
+        // foreground the bell's badge is enough, and a banner would be noise.
+        if !NSApplication.shared.isActive {
+            SystemNotifier.post(note)
+        }
+    }
+
+    /// Brings a notification's tab to the front — switching group and window if
+    /// need be — and marks it read.
+    func revealTab(_ tabID: TerminalTab.ID) {
+        guard let group = groups.first(where: { $0.tabs.contains { $0.id == tabID } }) else { return }
+        activeGroupID = group.id
+        withGroup(group.id) { $0.activeTabID = tabID }
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        markNotificationRead(for: tabID)
+    }
+
+    private func withGroup(_ id: TabGroup.ID, _ body: (inout TabGroup) -> Void) {
+        guard let index = groups.firstIndex(where: { $0.id == id }) else { return }
+        body(&groups[index])
+    }
+
+    func markAllNotificationsRead() {
+        for index in notifications.indices { notifications[index].isRead = true }
+    }
+
+    private func markNotificationRead(for tabID: TerminalTab.ID) {
+        for index in notifications.indices where notifications[index].tabID == tabID {
+            notifications[index].isRead = true
+        }
+    }
+
+    func clearNotifications() {
+        notifications.removeAll()
+    }
+}
+
+/// One entry in the notification bell: a command that finished somewhere the
+/// user was not looking.
+struct SwifttyNotification: Identifiable {
+    let id = UUID()
+    let command: String
+    let detail: String
+    let date: Date
+    let tabID: TerminalTab.ID
+    let groupName: String
+    let isError: Bool
+    var isRead = false
+
+    var relativeLabel: String {
+        if Date().timeIntervalSince(date) < 45 { return "just now" }
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .abbreviated
+        return formatter.localizedString(for: date, relativeTo: Date())
+    }
 }
 
 /// A named set of tabs. Groups let one window hold several independent sets of
@@ -1160,7 +1276,7 @@ struct WorkspaceChrome: View {
                     ) {
                         store.toggleAIPanel()
                     }
-                    ChromeButton(systemName: "bell", help: "Notifications") {}
+                    NotificationBell()
                     ChromeButton(systemName: "gearshape", help: "Settings") {
                         SettingsCoordinator.open(tab: .general)
                     }
