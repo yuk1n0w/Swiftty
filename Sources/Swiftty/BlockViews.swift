@@ -470,6 +470,11 @@ struct BlockStack<Terminal: View>: View {
                         onAcceptSuggestion: { draft += suggestion },
                         onEscape: dismissHistory,
                         focusRequests: editorFocusRequests,
+                        // Stops the composer stealing focus back from the
+                        // terminal while it fades out — whether the terminal
+                        // took over for a running command or a full-screen
+                        // program on the alternate screen.
+                        canClaimFocus: !tracker.runningVisible && !tracker.isAlternateScreen,
                         onComplete: completeToken,
                         onHeightChange: { editorHeight = $0 }
                     )
@@ -782,6 +787,12 @@ struct BlockStack<Terminal: View>: View {
     /// scrollable clear of it.
     private var composerHeight: CGFloat { editorHeight + promptChrome }
 
+    /// Fixed height of the one-line header above a running command. The terminal
+    /// is sized to the slot *minus* this, so header + terminal fill the slot
+    /// exactly rather than the terminal overflowing and its bottom rows — a
+    /// TUI's input and status lines — getting clipped below the window.
+    private var runningHeaderHeight: CGFloat { preferences.terminalFontSize + 16 }
+
     /// The running command: its meta line, and the live terminal beneath it.
     ///
     /// Collapses to nothing at a prompt, but the terminal is never removed from
@@ -815,11 +826,12 @@ struct BlockStack<Terminal: View>: View {
 
                     Spacer(minLength: 0)
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.leading, BlockStyle.leadingPadding)
                 .padding(.trailing, BlockStyle.trailingPadding)
-                .padding(.top, 6)
-                .padding(.bottom, 4)
+                // Fixed height so the terminal below can be sized to exactly
+                // the rest of the slot — see runningHeaderHeight.
+                .frame(maxWidth: .infinity, minHeight: runningHeaderHeight,
+                       maxHeight: runningHeaderHeight, alignment: .leading)
             }
 
             // The terminal keeps one size no matter what the slot around it is
@@ -835,8 +847,13 @@ struct BlockStack<Terminal: View>: View {
             Color.clear
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .overlay(alignment: .topLeading) {
+                    // Slot height minus the header, so all of the terminal's
+                    // rows fit; still one constant size whether running or at a
+                    // prompt, so the pty is never resized mid-command.
                     terminal
-                        .frame(height: showsBlocks ? runningHeight(viewport: viewport) : nil)
+                        .frame(height: showsBlocks
+                            ? runningHeight(viewport: viewport) - runningHeaderHeight
+                            : nil)
                         .opacity(isRunning || !showsBlocks ? 1 : 0)
                         .allowsHitTesting(isRunning || !showsBlocks)
                 }

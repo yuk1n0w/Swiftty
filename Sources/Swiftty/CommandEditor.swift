@@ -22,6 +22,11 @@ struct CommandEditor: NSViewRepresentable {
     var onEscape: () -> Void
     /// Bumped to pull the caret back here from wherever it went.
     var focusRequests: Int
+    /// False once a command is running. The composer lingers on screen for the
+    /// duration of its fade-out transition, and without this its updateNSView
+    /// keeps yanking focus back from the terminal the instant a command hands it
+    /// over — so a TUI wouldn't accept input until you switched tabs and back.
+    var canClaimFocus: Bool
     /// Expands the token under the caret; returns the new text and caret.
     var onComplete: (String, Int) -> (String, Int)?
     var onHeightChange: (CGFloat) -> Void
@@ -73,7 +78,7 @@ struct CommandEditor: NSViewRepresentable {
         if focusRequests != context.coordinator.lastFocusRequest {
             context.coordinator.lastFocusRequest = focusRequests
             DispatchQueue.main.async { view.window?.makeFirstResponder(view) }
-        } else {
+        } else if canClaimFocus {
             view.claimFocusFromTerminal()
         }
 

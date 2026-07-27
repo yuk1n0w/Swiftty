@@ -1551,26 +1551,11 @@ struct WorkspaceMain: View {
                 // active group's active tab is visible; the rest sit at zero
                 // opacity with hit-testing off.
                 ForEach(store.allTabs) { tab in
-                    let tracker = store.blockTracker(for: tab.id)
-                    BlockStack(
-                        tracker: tracker,
-                        terminal: TerminalSessionView(
-                            tabID: tab.id,
-                            isActive: tab.id == store.activeTabID,
-                            // The editor owns the keyboard until a command runs
-                            // long enough to be shown live; the terminal takes it
-                            // back then, for a full-screen program, or for a
-                            // shell we could not instrument. Keying on
-                            // runningVisible rather than runningBlock keeps the
-                            // editor focused through quick commands.
-                            wantsFocus: tracker.runningVisible
-                                || tracker.isAlternateScreen
-                                || !tracker.isIntegrationActive,
-                            tracker: tracker,
-                            onTitle: { store.updateTitle($0, for: tab.id) },
-                            onDirectory: { store.updateDirectory($0, for: tab.id) },
-                            onExit: { store.markExited(for: tab.id, code: $0) }
-                        )
+                    MountedTab(
+                        store: store,
+                        tab: tab,
+                        tracker: store.blockTracker(for: tab.id),
+                        isVisible: tab.id == store.activeTabID
                     )
                     // The active tab fades to the front; the rest fade back.
                     // No scale transform here — a fractional scale on the
@@ -1594,6 +1579,41 @@ struct WorkspaceMain: View {
         }
         .animation(.easeOut(duration: 0.24), value: store.aiPanelVisible)
         
+    }
+}
+
+/// One mounted tab: its block stack over its live terminal.
+///
+/// It observes the tracker, which is the whole point — `wantsFocus` is derived
+/// from tracker state, so when a command starts (or a full-screen program takes
+/// over) this re-renders and `TerminalSessionView` grabs the keyboard. The
+/// parent workspace does not observe the tracker, so computing `wantsFocus`
+/// there left it stale until an unrelated re-render (like switching tabs) — the
+/// reason a TUI would not accept input until you switched away and back.
+struct MountedTab: View {
+    let store: TerminalStore
+    let tab: TerminalTab
+    @ObservedObject var tracker: BlockTracker
+    let isVisible: Bool
+
+    var body: some View {
+        BlockStack(
+            tracker: tracker,
+            terminal: TerminalSessionView(
+                tabID: tab.id,
+                isActive: isVisible,
+                // The editor owns the keyboard until a command runs long enough
+                // to be shown live; the terminal takes it back then, for a
+                // full-screen program, or for a shell we could not instrument.
+                wantsFocus: tracker.runningVisible
+                    || tracker.isAlternateScreen
+                    || !tracker.isIntegrationActive,
+                tracker: tracker,
+                onTitle: { store.updateTitle($0, for: tab.id) },
+                onDirectory: { store.updateDirectory($0, for: tab.id) },
+                onExit: { store.markExited(for: tab.id, code: $0) }
+            )
+        )
     }
 }
 
