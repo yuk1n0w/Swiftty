@@ -117,7 +117,7 @@ private struct NotificationList: View {
                     LazyVStack(spacing: 0) {
                         ForEach(store.notifications) { note in
                             NotificationRow(note: note)
-                                .onTapGesture { store.revealTab(note.tabID) }
+                                .onTapGesture { store.revealTab(note.tabID, pane: note.paneID) }
                             Rectangle().fill(Color.white.opacity(0.05)).frame(height: 1)
                         }
                     }

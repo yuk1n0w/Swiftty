@@ -106,7 +106,15 @@ struct AIMessage: Identifiable, Equatable {
 
     let id = UUID()
     let role: Role
+    /// What the bubble shows.
     let content: String
+    /// What is actually sent to the model, when it must differ from what is
+    /// shown — e.g. an "Explain" carries a compact label in `content` but the
+    /// full command, exit code and output in `sent`. Nil means send `content`.
+    var sent: String? = nil
+
+    /// The text the provider should receive for this turn.
+    var payload: String { sent ?? content }
 }
 
 enum KeychainStore {
@@ -428,7 +436,7 @@ enum AIGateway {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         if !apiKey.isEmpty { request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization") }
         var requestMessages: [[String: String]] = messages.map {
-            ["role": $0.role.rawValue, "content": $0.content]
+            ["role": $0.role.rawValue, "content": $0.payload]
         }
         let systemPrompt = systemPrompt(agent: agent, customInstructions: customInstructions)
         if !systemPrompt.isEmpty {
@@ -469,7 +477,7 @@ enum AIGateway {
         var payload: [String: Any] = [
             "model": model,
             "max_tokens": 1024,
-            "messages": messages.map { ["role": $0.role.rawValue, "content": $0.content] },
+            "messages": messages.map { ["role": $0.role.rawValue, "content": $0.payload] },
         ]
         if !systemPrompt.isEmpty { payload["system"] = systemPrompt }
         request.httpBody = try JSONSerialization.data(withJSONObject: payload)
@@ -521,10 +529,33 @@ enum AIGateway {
     }
 
     private static func systemPrompt(agent: String, customInstructions: String) -> String {
-        var parts = ["You are the \(agent) agent inside Swiftty. Be concise, practical, and honest."]
+        var parts = [personaPrompt(agent)]
         let trimmed = customInstructions.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmed.isEmpty { parts.append(trimmed) }
         return parts.joined(separator: "\n\n")
+    }
+
+    /// Each persona is a genuinely different instruction, not a relabelled
+    /// default — the Coder is told to emit runnable fenced commands (which the
+    /// panel then turns into Insert/Copy actions), the Reviewer to hunt risk,
+    /// the Architect to reason about design.
+    static func personaPrompt(_ agent: String) -> String {
+        switch agent {
+        case "Reviewer":
+            return "You are a code reviewer working inside Swiftty, a terminal. Scrutinise "
+                + "commands, diffs and command output for bugs, security risks and bad practice. "
+                + "Flag anything destructive or irreversible before anything else. Be concise and specific."
+        case "Architect":
+            return "You are a software architect working inside Swiftty, a terminal. Favour design, "
+                + "trade-offs and the overall shape of a solution over line-by-line detail. Weigh "
+                + "maintainability and the bigger picture, and say plainly when a simpler approach is better."
+        case "Custom":
+            return "You are a helpful assistant inside Swiftty, a terminal. Be concise, practical, and honest."
+        default: // Coder
+            return "You are a coding assistant working inside Swiftty, a terminal. Help write, debug "
+                + "and run shell commands and code. Whenever you propose a command to run, put the exact "
+                + "command in its own fenced code block so it can be run directly. Be concise, practical, and honest."
+        }
     }
 
     private static func validate(response: URLResponse, data: Data) throws {
@@ -642,6 +673,28 @@ struct SwifttyApp: App {
                 }
                 .keyboardShortcut("t", modifiers: .command)
 
+                Button("Split Right") {
+                    store.splitActivePane(.row)
+                }
+                .keyboardShortcut("d", modifiers: .command)
+
+                Button("Split Down") {
+                    store.splitActivePane(.column)
+                }
+                .keyboardShortcut("d", modifiers: [.command, .shift])
+
+                Button("Focus Next Pane") {
+                    store.selectRelativePane(by: 1)
+                }
+                .keyboardShortcut("]", modifiers: [.command, .option])
+                .disabled((store.activeTab?.panes.count ?? 0) < 2)
+
+                Button("Focus Previous Pane") {
+                    store.selectRelativePane(by: -1)
+                }
+                .keyboardShortcut("[", modifiers: [.command, .option])
+                .disabled((store.activeTab?.panes.count ?? 0) < 2)
+
                 Button("Select Tab 1") { store.select(index: 0) }
                     .keyboardShortcut("1", modifiers: .command)
                     .disabled(store.tabs.count < 1)
@@ -680,10 +733,15 @@ struct SwifttyApp: App {
                 }
                 .keyboardShortcut(.tab, modifiers: [.control, .shift])
 
+                Button("Close Pane") {
+                    store.closeActivePane()
+                }
+                .keyboardShortcut("w", modifiers: .command)
+
                 Button("Close Tab") {
                     store.closeActiveTab()
                 }
-                .keyboardShortcut("w", modifiers: .command)
+                .keyboardShortcut("w", modifiers: [.command, .shift])
 
                 Divider()
 
@@ -722,6 +780,11 @@ struct SwifttyApp: App {
                     store.clearBlocks()
                 }
                 .keyboardShortcut("k", modifiers: .command)
+
+                Button("Reset Terminal") {
+                    store.resetActiveTerminal()
+                }
+                .keyboardShortcut("k", modifiers: [.command, .shift])
 
                 Button("Previous Block") {
                     store.stepBlockSelection(by: -1)
@@ -766,6 +829,9 @@ final class TerminalStore: ObservableObject {
     @Published var searchMatchIndex = 0
     @Published private(set) var aiMessages: [AIMessage] = []
     @Published private(set) var aiSending = false
+    /// A command the AI panel wants dropped into the composer for review. The
+    /// active tab's `BlockStack` picks it up, fills its input, and clears it.
+    @Published var composerInjection: String?
 
     /// Notifications raised when a command finishes in a tab the user was not
     /// watching, newest first.
@@ -786,28 +852,114 @@ final class TerminalStore: ObservableObject {
     /// publishing the dictionary would fire while a view body is reading it.
     private var blockTrackers: [TerminalTab.ID: BlockTracker] = [:]
 
+    /// Saves the tab layout a beat after it changes. Debounced so a burst of
+    /// mutations (opening several tabs, a directory walk) writes once.
+    private var sessionCancellable: AnyCancellable?
+    private static let sessionKey = "session.v2"
+
     let preferences: AppPreferences
 
     init(preferences: AppPreferences) {
         self.preferences = preferences
-        let initialTab = TerminalTab()
-        let group = TabGroup(name: "Default", tabs: [initialTab], activeTabID: initialTab.id)
-        groups = [group]
-        activeGroupID = group.id
-        _ = makeTracker(for: initialTab.id)
+
+        if let session = Self.loadSession() {
+            let restored = session.groups.map { group -> TabGroup in
+                let tabs = group.tabs.map { pt -> TerminalTab in
+                    let panes = pt.panes.map {
+                        Pane(id: $0.id, title: $0.title, directory: $0.directory)
+                    }
+                    return TerminalTab(
+                        id: pt.id,
+                        panes: panes,
+                        layout: pt.layout,
+                        activePaneID: pt.activePaneID
+                    )
+                }
+                // A saved active tab that somehow no longer exists falls back to
+                // the group's first, so no group is left pointing at nothing.
+                let active = tabs.contains { $0.id == group.activeTabID }
+                    ? group.activeTabID
+                    : tabs[0].id
+                return TabGroup(id: group.id, name: group.name, tabs: tabs, activeTabID: active)
+            }
+            groups = restored
+            activeGroupID = restored.contains { $0.id == session.activeGroupID }
+                ? session.activeGroupID
+                : restored[0].id
+            for pane in restored.flatMap(\.tabs).flatMap(\.panes) { makeTracker(for: pane.id) }
+        } else {
+            let initialTab = TerminalTab()
+            let group = TabGroup(name: "Default", tabs: [initialTab], activeTabID: initialTab.id)
+            groups = [group]
+            activeGroupID = group.id
+            for pane in initialTab.panes { makeTracker(for: pane.id) }
+        }
+
+        startPersistingSession()
     }
 
-    /// Creates a tab's tracker and wires it to raise notifications when a
+    /// Creates a pane's tracker and wires it to raise notifications when a
     /// command finishes there. Every tracker is born through here so the
     /// notification hook is never forgotten at a call site.
     @discardableResult
-    private func makeTracker(for tabID: TerminalTab.ID) -> BlockTracker {
+    private func makeTracker(for paneID: Pane.ID) -> BlockTracker {
         let tracker = BlockTracker()
         tracker.onCommandFinished = { [weak self] block in
-            self?.handleFinishedCommand(block, tabID: tabID)
+            self?.handleFinishedCommand(block, paneID: paneID)
         }
-        blockTrackers[tabID] = tracker
+        blockTrackers[paneID] = tracker
         return tracker
+    }
+
+    // MARK: - Session persistence
+
+    private func startPersistingSession() {
+        sessionCancellable = Publishers.CombineLatest($groups, $activeGroupID)
+            // Persists the current layout a beat after any change — and once
+            // shortly after launch, so even an untouched single-tab window is on
+            // disk to be restored. Re-writing the just-restored state is
+            // idempotent, so there is no need to skip the initial value.
+            .debounce(for: .seconds(0.4), scheduler: RunLoop.main)
+            .sink { [weak self] _ in self?.persistSession() }
+    }
+
+    private func persistSession() {
+        let session = PersistedSession(
+            activeGroupID: activeGroupID,
+            groups: groups.map { group in
+                PersistedGroup(
+                    id: group.id,
+                    name: group.name,
+                    activeTabID: group.activeTabID,
+                    tabs: group.tabs.map { tab in
+                        PersistedTab(
+                            id: tab.id,
+                            activePaneID: tab.activePaneID,
+                            panes: tab.panes.map {
+                                PersistedPane(id: $0.id, title: $0.title, directory: $0.directory)
+                            },
+                            layout: tab.layout
+                        )
+                    }
+                )
+            }
+        )
+        guard let data = try? JSONEncoder().encode(session) else { return }
+        UserDefaults.standard.set(data, forKey: Self.sessionKey)
+    }
+
+    private static func loadSession() -> PersistedSession? {
+        guard let data = UserDefaults.standard.data(forKey: sessionKey),
+              var session = try? JSONDecoder().decode(PersistedSession.self, from: data)
+        else { return nil }
+        // Drop any tab that saved without panes, then any group left without
+        // tabs — restoring either would leave something that can never be shown
+        // and would crash the `[0]` fallbacks.
+        for index in session.groups.indices {
+            session.groups[index].tabs.removeAll { $0.panes.isEmpty }
+        }
+        session.groups.removeAll { $0.tabs.isEmpty }
+        return session.groups.isEmpty ? nil : session
     }
 
     // MARK: - Tabs (scoped to the active group)
@@ -845,9 +997,35 @@ final class TerminalStore: ObservableObject {
         }
     }
 
+    /// Mutates the pane with `id`, wherever it lives.
+    private func withPane(_ id: Pane.ID, _ body: (inout Pane) -> Void) {
+        for groupIndex in groups.indices {
+            for tabIndex in groups[groupIndex].tabs.indices {
+                if let paneIndex = groups[groupIndex].tabs[tabIndex].panes.firstIndex(where: { $0.id == id }) {
+                    body(&groups[groupIndex].tabs[tabIndex].panes[paneIndex])
+                    return
+                }
+            }
+        }
+    }
+
+    /// Where a pane lives, as indices into `groups` and its tab's `tabs`.
+    private func paneLocation(_ id: Pane.ID) -> (group: Int, tab: Int)? {
+        for groupIndex in groups.indices {
+            for tabIndex in groups[groupIndex].tabs.indices
+            where groups[groupIndex].tabs[tabIndex].panes.contains(where: { $0.id == id }) {
+                return (groupIndex, tabIndex)
+            }
+        }
+        return nil
+    }
+
     func newTab() {
-        let tab = TerminalTab()
-        makeTracker(for: tab.id)
+        // Open where the current tab is, the way a new tab in any terminal does.
+        // A remote or deleted directory is caught at spawn and falls back home.
+        let pane = Pane(directory: activeTab?.directory ?? ShellInfo.homePath)
+        let tab = TerminalTab(pane: pane)
+        makeTracker(for: pane.id)
         mutateActiveGroup {
             $0.tabs.append(tab)
             $0.activeTabID = tab.id
@@ -880,7 +1058,7 @@ final class TerminalStore: ObservableObject {
 
     func newGroup() {
         let tab = TerminalTab()
-        makeTracker(for: tab.id)
+        for pane in tab.panes { makeTracker(for: pane.id) }
         let group = TabGroup(
             name: "Group \(groups.count + 1)",
             tabs: [tab],
@@ -888,6 +1066,101 @@ final class TerminalStore: ObservableObject {
         )
         groups.append(group)
         activeGroupID = group.id
+    }
+
+    // MARK: - Panes (splits)
+
+    /// The pane taking input in the active tab.
+    var activePaneID: Pane.ID? { activeTab?.activePaneID }
+
+    /// The tracker for a specific pane.
+    func paneTracker(_ paneID: Pane.ID) -> BlockTracker { blockTracker(for: paneID) }
+
+    /// Makes a pane the one that takes input within its tab.
+    func focusPane(_ paneID: Pane.ID) {
+        guard let loc = paneLocation(paneID),
+              groups[loc.group].tabs[loc.tab].activePaneID != paneID else { return }
+        groups[loc.group].tabs[loc.tab].activePaneID = paneID
+    }
+
+    /// Splits the active tab's focused pane, opening a new shell beside it in the
+    /// same directory and moving focus to it.
+    func splitActivePane(_ axis: SplitAxis) {
+        guard let tab = activeTab, let loc = paneLocation(tab.activePaneID) else { return }
+        let inheritDir = tab.activePane?.directory ?? ShellInfo.homePath
+        let pane = Pane(directory: inheritDir)
+        makeTracker(for: pane.id)
+        groups[loc.group].tabs[loc.tab].panes.append(pane)
+        groups[loc.group].tabs[loc.tab].layout =
+            groups[loc.group].tabs[loc.tab].layout.splitting(tab.activePaneID, with: pane.id, axis: axis)
+        groups[loc.group].tabs[loc.tab].activePaneID = pane.id
+    }
+
+    /// Closes the focused pane; if it was the tab's only pane, closes the tab.
+    func closeActivePane() {
+        guard let paneID = activePaneID else { return }
+        closePane(paneID)
+    }
+
+    func closePane(_ paneID: Pane.ID) {
+        guard let loc = paneLocation(paneID) else { return }
+        // The tab's last pane: fall back to closing the whole tab (which handles
+        // the last-tab-closes-the-window case too).
+        guard groups[loc.group].tabs[loc.tab].panes.count > 1 else {
+            close(groups[loc.group].tabs[loc.tab].id)
+            return
+        }
+        blockTrackers.removeValue(forKey: paneID)
+        ShellIntegration.cleanUp(tabID: paneID)
+        var tab = groups[loc.group].tabs[loc.tab]
+        let collapsed = tab.layout.removing(paneID) ?? tab.layout
+        tab.panes.removeAll { $0.id == paneID }
+        tab.layout = collapsed
+        if tab.activePaneID == paneID {
+            tab.activePaneID = collapsed.paneIDs.first ?? tab.panes[0].id
+        }
+        groups[loc.group].tabs[loc.tab] = tab
+    }
+
+    /// Moves focus to the next/previous pane within the active tab, wrapping.
+    func selectRelativePane(by offset: Int) {
+        guard let tab = activeTab else { return }
+        let order = tab.layout.paneIDs
+        guard order.count > 1, let current = order.firstIndex(of: tab.activePaneID) else { return }
+        focusPane(order[(current + offset + order.count) % order.count])
+    }
+
+    /// Explodes a split tab into one tab per pane, in reading order, keeping every
+    /// shell alive — the panes keep their ids (and trackers), so the flat pane
+    /// mount just re-homes their terminals rather than rebuilding them.
+    func breakUpTab(_ tabID: TerminalTab.ID) {
+        guard let groupIndex = groups.firstIndex(where: { $0.tabs.contains { $0.id == tabID } }),
+              let tabIndex = groups[groupIndex].tabs.firstIndex(where: { $0.id == tabID }) else { return }
+        let tab = groups[groupIndex].tabs[tabIndex]
+        guard tab.panes.count > 1 else { return }
+
+        let ordered = tab.layout.paneIDs.compactMap { id in tab.panes.first { $0.id == id } }
+        guard !ordered.isEmpty else { return }
+        // The first pane keeps this tab's id so the tab you right-clicked stays
+        // put; the rest each become a fresh single-pane tab after it.
+        let newTabs = ordered.enumerated().map { index, pane in
+            TerminalTab(id: index == 0 ? tab.id : UUID(), pane: pane)
+        }
+        groups[groupIndex].tabs.replaceSubrange(tabIndex...tabIndex, with: newTabs)
+        // Keep focus on the pane that was active before the break-up.
+        groups[groupIndex].activeTabID =
+            newTabs.first { $0.activePaneID == tab.activePaneID }?.id ?? newTabs[0].id
+    }
+
+    /// Nudges a split divider (identified by its path in the tab's layout tree) by
+    /// `delta` points along `total`, the dimension it slides within.
+    func adjustSplit(in tabID: TerminalTab.ID, path: [Int], delta: CGFloat, total: CGFloat) {
+        guard total > 0, let groupIndex = groups.firstIndex(where: { $0.tabs.contains { $0.id == tabID } }),
+              let tabIndex = groups[groupIndex].tabs.firstIndex(where: { $0.id == tabID }),
+              let current = groups[groupIndex].tabs[tabIndex].layout.fraction(at: path) else { return }
+        let next = current + Double(delta / total)
+        groups[groupIndex].tabs[tabIndex].layout =
+            groups[groupIndex].tabs[tabIndex].layout.settingFraction(next, at: path)
     }
 
     func selectGroup(_ id: TabGroup.ID) {
@@ -911,9 +1184,9 @@ final class TerminalStore: ObservableObject {
     /// Closes a whole group and every shell in it. The last group is kept.
     func closeGroup(_ id: TabGroup.ID) {
         guard groups.count > 1, let index = groups.firstIndex(where: { $0.id == id }) else { return }
-        for tab in groups[index].tabs {
-            blockTrackers.removeValue(forKey: tab.id)
-            ShellIntegration.cleanUp(tabID: tab.id)
+        for pane in groups[index].tabs.flatMap(\.panes) {
+            blockTrackers.removeValue(forKey: pane.id)
+            ShellIntegration.cleanUp(tabID: pane.id)
         }
         groups.remove(at: index)
         if activeGroupID == id {
@@ -945,19 +1218,25 @@ final class TerminalStore: ObservableObject {
         aiPanelVisible.toggle()
     }
 
-    /// The tracker for a tab. Trackers are created alongside their tab, so the
-    /// fallback here only ever fires for a tab that has already been closed.
-    func blockTracker(for tabID: TerminalTab.ID) -> BlockTracker {
-        blockTrackers[tabID] ?? BlockTracker()
+    /// The tracker for a pane. Trackers are created alongside their pane, so the
+    /// fallback here only ever fires for a pane that has already been closed.
+    func blockTracker(for paneID: Pane.ID) -> BlockTracker {
+        blockTrackers[paneID] ?? BlockTracker()
     }
 
     var activeBlockTracker: BlockTracker? {
-        blockTrackers[activeTabID]
+        activePaneID.flatMap { blockTrackers[$0] }
     }
 
     /// Wipes the active tab's block history.
     func clearBlocks() {
         activeBlockTracker?.clearHistory()
+    }
+
+    /// Repairs the active terminal's emulator state (⇧⌘K) without touching a
+    /// running program.
+    func resetActiveTerminal() {
+        activeBlockTracker?.resetTerminal()
     }
 
     /// Moves the block selection in the active tab. `offset` is -1 for the
@@ -985,10 +1264,16 @@ final class TerminalStore: ObservableObject {
 
     func sendAI(_ prompt: String) async {
         let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, !aiSending else { return }
+        guard !trimmed.isEmpty else { return }
+        await sendAIMessage(AIMessage(role: .user, content: trimmed))
+    }
 
-        let userMessage = AIMessage(role: .user, content: trimmed)
-        aiMessages.append(userMessage)
+    /// Sends one already-built user message and appends the reply. Shared by the
+    /// free-text composer and the block actions, which carry a compact label to
+    /// show but a fuller context to send.
+    private func sendAIMessage(_ message: AIMessage) async {
+        guard !aiSending else { return }
+        aiMessages.append(message)
         aiSending = true
         defer { aiSending = false }
 
@@ -1013,6 +1298,70 @@ final class TerminalStore: ObservableObject {
         }
     }
 
+    // MARK: - AI on blocks
+
+    enum BlockAIMode { case explain, fix }
+
+    /// Opens the AI panel and asks about a specific block, feeding the model the
+    /// command, its exit code and (clipped) output while showing only a compact
+    /// label in the transcript.
+    func askAI(about block: CommandBlock, tracker: BlockTracker, mode: BlockAIMode) {
+        guard !block.command.isEmpty, !aiSending else { return }
+        aiPanelVisible = true
+        let message = Self.blockPrompt(
+            block: block,
+            output: tracker.plainOutput(for: block),
+            mode: mode
+        )
+        Task { await sendAIMessage(message) }
+    }
+
+    /// Fills the active tab's composer with a command for the user to review and
+    /// run — the AI never runs anything itself.
+    func insertIntoComposer(_ command: String) {
+        let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        composerInjection = trimmed
+    }
+
+    private static func blockPrompt(block: CommandBlock, output: String, mode: BlockAIMode) -> AIMessage {
+        let exit = block.state.exitCode
+        let clipped = clip(output, maxLines: 120, maxChars: 6000)
+        let label: String
+        let instruction: String
+        switch mode {
+        case .explain:
+            label = "Explain `\(block.command)`"
+            instruction = "Explain what this command does and interpret its output. Be concise."
+        case .fix:
+            label = "Fix `\(block.command)`"
+            instruction = "This command did not do what was intended. Diagnose the problem "
+                + "from its output, then give the corrected command inside a single fenced "
+                + "code block, followed by a one-line explanation."
+        }
+        var sent = instruction + "\n\nCommand:\n```\n" + block.command + "\n```\n"
+        sent += "\nWorking directory: \(block.directory)\n"
+        if let exit { sent += "Exit code: \(exit)\n" }
+        sent += "\nOutput:\n```\n" + (clipped.isEmpty ? "(no output)" : clipped) + "\n```"
+        return AIMessage(role: .user, content: label, sent: sent)
+    }
+
+    /// Keeps a block's output within a sane size for a prompt: the tail is what
+    /// matters for an error, so earlier lines are dropped first.
+    private static func clip(_ text: String, maxLines: Int, maxChars: Int) -> String {
+        var lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        var note = ""
+        if lines.count > maxLines {
+            lines = Array(lines.suffix(maxLines))
+            note = "… (earlier output trimmed)\n"
+        }
+        var result = note + lines.joined(separator: "\n")
+        if result.count > maxChars {
+            result = "…\n" + String(result.suffix(maxChars))
+        }
+        return result
+    }
+
     func closeActiveTab() {
         close(activeTabID)
     }
@@ -1031,9 +1380,11 @@ final class TerminalStore: ObservableObject {
             return
         }
 
-        groups[groupIndex].tabs.remove(at: tabIndex)
-        blockTrackers.removeValue(forKey: tabID)
-        ShellIntegration.cleanUp(tabID: tabID)
+        let removed = groups[groupIndex].tabs.remove(at: tabIndex)
+        for pane in removed.panes {
+            blockTrackers.removeValue(forKey: pane.id)
+            ShellIntegration.cleanUp(tabID: pane.id)
+        }
 
         if groups[groupIndex].tabs.isEmpty {
             let closingGroupID = groups[groupIndex].id
@@ -1047,23 +1398,24 @@ final class TerminalStore: ObservableObject {
         }
     }
 
-    func updateTitle(_ title: String, for tabID: TerminalTab.ID) {
+    func updateTitle(_ title: String, for paneID: Pane.ID) {
         let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        withTab(tabID) { $0.title = trimmed }
+        withPane(paneID) { $0.title = trimmed }
     }
 
-    func updateDirectory(_ directory: String?, for tabID: TerminalTab.ID) {
-        withTab(tabID) { $0.directory = directory }
+    func updateDirectory(_ directory: String?, for paneID: Pane.ID) {
+        withPane(paneID) { $0.directory = directory }
     }
 
-    func markExited(for tabID: TerminalTab.ID, code: Int32?) {
-        withTab(tabID) { $0.exitCode = code }
-        // A shell that exited is a dead tab — `exit` should close it the way it
-        // would in any terminal. `close` closes the window if it was the last
-        // tab anywhere. Only the *local* shell process ending reaches here;
-        // exiting an SSH session returns to the local shell, never terminates it.
-        close(tabID)
+    func markExited(for paneID: Pane.ID, code: Int32?) {
+        withPane(paneID) { $0.exitCode = code }
+        // A shell that exited is a dead pane — `exit` closes it the way it would
+        // in any terminal, collapsing the split; the tab's last pane closes the
+        // tab, and the last tab anywhere closes the window. Only a *local* shell
+        // process ending reaches here; leaving an SSH session returns to the
+        // local shell rather than terminating it.
+        closePane(paneID)
     }
 
     // MARK: - Notifications
@@ -1074,16 +1426,22 @@ final class TerminalStore: ObservableObject {
     /// or a failure in a background tab, or anything that finished while the app
     /// was in the background. A quick command in the tab you are staring at is
     /// never a notification.
-    private func handleFinishedCommand(_ block: CommandBlock, tabID: TerminalTab.ID) {
+    private func handleFinishedCommand(_ block: CommandBlock, paneID: Pane.ID) {
         guard !block.command.isEmpty else { return }
 
         let failed = (block.state.exitCode ?? 0) != 0
         let ranLong = (block.duration ?? 0) >= Self.notifyThreshold
         guard failed || ranLong else { return }
 
-        // Watching means: app frontmost and this is the visible tab. Then you
-        // saw it happen and don't need telling.
-        let watching = NSApplication.shared.isActive && tabID == activeTabID
+        guard let loc = paneLocation(paneID) else { return }
+        let tab = groups[loc.group].tabs[loc.tab]
+
+        // Watching means: app frontmost, this is the visible tab, and this is the
+        // pane in focus. A command in a background pane of the front tab still
+        // notifies — you were not looking at it.
+        let watching = NSApplication.shared.isActive
+            && tab.id == activeTabID
+            && paneID == tab.activePaneID
         guard !watching else { return }
 
         let note = SwifttyNotification(
@@ -1092,8 +1450,9 @@ final class TerminalStore: ObservableObject {
                 ? "failed" + (block.state.exitCode.map { " (exit \($0))" } ?? "")
                 : "finished" + (block.durationLabel.map { " in \($0)" } ?? ""),
             date: block.finishedAt ?? Date(),
-            tabID: tabID,
-            groupName: groups.first { $0.tabs.contains { $0.id == tabID } }?.name ?? "",
+            tabID: tab.id,
+            paneID: paneID,
+            groupName: groups[loc.group].name,
             isError: failed
         )
         notifications.insert(note, at: 0)
@@ -1109,11 +1468,18 @@ final class TerminalStore: ObservableObject {
     }
 
     /// Brings a notification's tab to the front — switching group and window if
-    /// need be — and marks it read.
-    func revealTab(_ tabID: TerminalTab.ID) {
+    /// need be, and focusing the pane the command finished in — and marks it read.
+    func revealTab(_ tabID: TerminalTab.ID, pane paneID: Pane.ID? = nil) {
         guard let group = groups.first(where: { $0.tabs.contains { $0.id == tabID } }) else { return }
         activeGroupID = group.id
-        withGroup(group.id) { $0.activeTabID = tabID }
+        withGroup(group.id) {
+            $0.activeTabID = tabID
+            if let paneID,
+               let tabIndex = $0.tabs.firstIndex(where: { $0.id == tabID }),
+               $0.tabs[tabIndex].panes.contains(where: { $0.id == paneID }) {
+                $0.tabs[tabIndex].activePaneID = paneID
+            }
+        }
         NSApplication.shared.activate(ignoringOtherApps: true)
         markNotificationRead(for: tabID)
     }
@@ -1146,6 +1512,7 @@ struct SwifttyNotification: Identifiable {
     let detail: String
     let date: Date
     let tabID: TerminalTab.ID
+    let paneID: Pane.ID
     let groupName: String
     let isError: Bool
     var isRead = false
@@ -1174,7 +1541,10 @@ struct TabGroup: Identifiable, Equatable {
     }
 }
 
-struct TerminalTab: Identifiable, Equatable {
+/// One terminal within a tab. A tab with no splits has exactly one pane; each
+/// split adds another. Panes are the unit that owns a shell, a tracker and the
+/// title/directory the shell reports — everything a tab used to own directly.
+struct Pane: Identifiable, Equatable {
     let id: UUID
     var title: String
     var directory: String?
@@ -1183,7 +1553,7 @@ struct TerminalTab: Identifiable, Equatable {
     init(
         id: UUID = UUID(),
         title: String = ShellInfo.displayName,
-        directory: String? = FileManager.default.homeDirectoryForCurrentUser.path,
+        directory: String? = ShellInfo.homePath,
         exitCode: Int32? = nil
     ) {
         self.id = id
@@ -1191,6 +1561,143 @@ struct TerminalTab: Identifiable, Equatable {
         self.directory = directory
         self.exitCode = exitCode
     }
+}
+
+/// Which way a split lays its two children out.
+enum SplitAxis: String, Codable, Equatable {
+    case row      // side by side  (a vertical divider)
+    case column   // stacked       (a horizontal divider)
+}
+
+/// A tab's pane layout: a binary tree whose leaves are panes. Each split stores
+/// the fraction of space its first child takes, so dividers are draggable and the
+/// ratio survives a relaunch.
+indirect enum PaneNode: Equatable, Codable {
+    case leaf(UUID)
+    case split(axis: SplitAxis, first: PaneNode, second: PaneNode, fraction: Double)
+
+    /// Every pane id under this node, left-to-right / top-to-bottom.
+    var paneIDs: [UUID] {
+        switch self {
+        case .leaf(let id): return [id]
+        case .split(_, let a, let b, _): return a.paneIDs + b.paneIDs
+        }
+    }
+
+    /// Splits the given leaf in place, adding `newPane` beside it 50/50.
+    func splitting(_ paneID: UUID, with newPane: UUID, axis: SplitAxis) -> PaneNode {
+        switch self {
+        case .leaf(let id):
+            return id == paneID
+                ? .split(axis: axis, first: .leaf(id), second: .leaf(newPane), fraction: 0.5)
+                : self
+        case .split(let ax, let a, let b, let f):
+            return .split(axis: ax,
+                          first: a.splitting(paneID, with: newPane, axis: axis),
+                          second: b.splitting(paneID, with: newPane, axis: axis),
+                          fraction: f)
+        }
+    }
+
+    /// Removes a leaf, collapsing the split it lived in to its sibling. Returns
+    /// nil if this whole node was that single leaf.
+    func removing(_ paneID: UUID) -> PaneNode? {
+        switch self {
+        case .leaf(let id):
+            return id == paneID ? nil : self
+        case .split(let ax, let a, let b, let f):
+            let na = a.removing(paneID)
+            let nb = b.removing(paneID)
+            if na == nil { return nb }
+            if nb == nil { return na }
+            return .split(axis: ax, first: na!, second: nb!, fraction: f)
+        }
+    }
+
+    /// The fraction stored at the split reached by `path` (0 = first child, 1 =
+    /// second), or nil if the path does not land on a split.
+    func fraction(at path: [Int]) -> Double? {
+        guard case .split(_, let a, let b, let f) = self else { return nil }
+        if path.isEmpty { return f }
+        let tail = Array(path.dropFirst())
+        return path[0] == 0 ? a.fraction(at: tail) : b.fraction(at: tail)
+    }
+
+    /// Returns a copy with the split at `path` set to `value`, clamped so a pane
+    /// can never be dragged to nothing.
+    func settingFraction(_ value: Double, at path: [Int]) -> PaneNode {
+        guard case .split(let ax, let a, let b, let f) = self else { return self }
+        if path.isEmpty {
+            return .split(axis: ax, first: a, second: b, fraction: min(0.85, max(0.15, value)))
+        }
+        let tail = Array(path.dropFirst())
+        return .split(axis: ax,
+                      first: path[0] == 0 ? a.settingFraction(value, at: tail) : a,
+                      second: path[0] == 1 ? b.settingFraction(value, at: tail) : b,
+                      fraction: f)
+    }
+}
+
+struct TerminalTab: Identifiable, Equatable {
+    let id: UUID
+    var panes: [Pane]
+    var layout: PaneNode
+    var activePaneID: UUID
+
+    /// A fresh single-pane tab.
+    init(id: UUID = UUID(), pane: Pane = Pane()) {
+        self.id = id
+        self.panes = [pane]
+        self.layout = .leaf(pane.id)
+        self.activePaneID = pane.id
+    }
+
+    /// A multi-pane tab, e.g. one being restored.
+    init(id: UUID, panes: [Pane], layout: PaneNode, activePaneID: UUID) {
+        self.id = id
+        self.panes = panes
+        self.layout = layout
+        self.activePaneID = panes.contains { $0.id == activePaneID } ? activePaneID : panes[0].id
+    }
+
+    var activePane: Pane? { panes.first { $0.id == activePaneID } }
+    /// The tab's label follows whichever pane is focused.
+    var title: String { activePane?.title ?? ShellInfo.displayName }
+    var directory: String? { activePane?.directory }
+    var isSplit: Bool { panes.count > 1 }
+}
+
+// MARK: - Session persistence
+
+/// The window's tab layout, saved to `UserDefaults` so a relaunch reopens the
+/// same tabs in the same working directories rather than a single fresh shell.
+///
+/// Only what is cheap and safe to restore is stored: a live shell cannot be
+/// resurrected, so each tab reopens a new shell pointed at its last directory.
+/// Block history and running processes are deliberately not persisted.
+struct PersistedSession: Codable {
+    var activeGroupID: UUID
+    var groups: [PersistedGroup]
+}
+
+struct PersistedGroup: Codable {
+    var id: UUID
+    var name: String
+    var activeTabID: UUID
+    var tabs: [PersistedTab]
+}
+
+struct PersistedTab: Codable {
+    var id: UUID
+    var activePaneID: UUID
+    var panes: [PersistedPane]
+    var layout: PaneNode
+}
+
+struct PersistedPane: Codable {
+    var id: UUID
+    var title: String
+    var directory: String?
 }
 
 struct TerminalWorkspace: View {
@@ -1209,7 +1716,7 @@ struct TerminalWorkspace: View {
 
                 HStack(spacing: 0) {
                     if store.sidebarVisible {
-                        WorkspaceSidebar(tracker: store.blockTracker(for: store.activeTabID))
+                        WorkspaceSidebar(tracker: store.blockTracker(for: store.activePaneID ?? store.activeTabID))
                             .frame(width: preferences.sidebarWidth)
                             .transition(.move(edge: .leading).combined(with: .opacity))
 
@@ -1437,10 +1944,16 @@ struct TerminalTabStrip: View {
         HStack(spacing: 4) {
             ForEach(store.tabs) { tab in
                 TerminalTabButton(
-                    tracker: store.blockTracker(for: tab.id),
+                    // The active pane's tracker drives the icon, rename and menu;
+                    // the pane trackers (in layout order) drive the label so a
+                    // split shows every pane's name.
+                    tracker: store.blockTracker(for: tab.activePaneID),
+                    paneTrackers: tab.layout.paneIDs.map { store.blockTracker(for: $0) },
                     isActive: tab.id == store.activeTabID,
+                    paneCount: tab.panes.count,
                     onSelect: { store.select(tab.id) },
-                    onClose: { store.close(tab.id) }
+                    onClose: { store.close(tab.id) },
+                    onBreakUp: { store.breakUpTab(tab.id) }
                 )
                 // A new tab grows in from the trailing edge; a closed one
                 // collapses away, so the strip reshuffles smoothly instead of
@@ -1464,13 +1977,35 @@ struct TerminalTabStrip: View {
     }
 }
 
+/// One pane's name inside a tab button, observing that pane's tracker so it
+/// updates as the pane runs a command or changes directory.
+private struct TabPaneLabel: View {
+    @ObservedObject var tracker: BlockTracker
+    let emphasized: Bool
+
+    var body: some View {
+        Text(tracker.tabLabel)
+            .font(.system(size: 12, weight: emphasized ? .semibold : .regular))
+            .lineLimit(1)
+            .truncationMode(.tail)
+    }
+}
+
 struct TerminalTabButton: View {
     // Observed, not read through the store: the label changes when a command
     // starts or the directory moves, and the store publishes neither.
     @ObservedObject var tracker: BlockTracker
+    /// The panes' trackers in layout order, so a split tab shows every name.
+    var paneTrackers: [BlockTracker] = []
     let isActive: Bool
+    var paneCount: Int = 1
     let onSelect: () -> Void
     let onClose: () -> Void
+    var onBreakUp: () -> Void = {}
+
+    private var labelTrackers: [BlockTracker] {
+        paneTrackers.isEmpty ? [tracker] : paneTrackers
+    }
 
     var body: some View {
         Button(action: onSelect) {
@@ -1479,9 +2014,36 @@ struct TerminalTabButton: View {
                     .font(.system(size: 12, weight: .medium))
                     .symbolEffect(.pulse, isActive: tracker.runningBlock != nil)
 
-                Text(tracker.tabLabel)
-                    .font(.system(size: 12, weight: isActive ? .semibold : .regular))
-                    .lineLimit(1)
+                // One name per pane, the focused one emphasised. `enumerated` id
+                // is fine — the order is stable for a given render.
+                HStack(spacing: 5) {
+                    ForEach(Array(labelTrackers.enumerated()), id: \.offset) { index, paneTracker in
+                        if index > 0 {
+                            Text("·")
+                                .font(.system(size: 12))
+                                .foregroundStyle(.tertiary)
+                        }
+                        TabPaneLabel(
+                            tracker: paneTracker,
+                            emphasized: isActive && paneTracker === tracker
+                        )
+                    }
+                }
+
+                // A split tab carries more than one shell; show how many so the
+                // strip does not misleadingly read as a single terminal.
+                if paneCount > 1 {
+                    HStack(spacing: 2) {
+                        Image(systemName: "rectangle.split.2x1")
+                            .font(.system(size: 9, weight: .semibold))
+                        Text("\(paneCount)")
+                            .font(.system(size: 10, weight: .semibold, design: .rounded))
+                    }
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 1)
+                    .background(Capsule().fill(Color.white.opacity(0.08)))
+                }
             }
             .padding(.horizontal, 12)
             .frame(height: 30)
@@ -1502,6 +2064,10 @@ struct TerminalTabButton: View {
             Button("Rename…") { rename() }
             if tracker.hasCustomName {
                 Button("Use Automatic Name") { tracker.customName = nil }
+            }
+            if paneCount > 1 {
+                Divider()
+                Button("Split into Separate Tabs") { onBreakUp() }
             }
             Divider()
             Button("Close Tab") { onClose() }
@@ -1545,30 +2111,11 @@ struct WorkspaceMain: View {
 
     var body: some View {
         HStack(spacing: 0) {
-            ZStack {
-                // Every tab in every group is mounted, so switching groups
-                // never tears a terminal down and kills its shell. Only the
-                // active group's active tab is visible; the rest sit at zero
-                // opacity with hit-testing off.
-                ForEach(store.allTabs) { tab in
-                    MountedTab(
-                        store: store,
-                        tab: tab,
-                        tracker: store.blockTracker(for: tab.id),
-                        isVisible: tab.id == store.activeTabID
-                    )
-                    // The active tab fades to the front; the rest fade back.
-                    // No scale transform here — a fractional scale on the
-                    // AppKit-backed terminal keeps AppKit re-running autolayout
-                    // every frame, burning CPU at idle. Opacity alone is free.
-                    .opacity(tab.id == store.activeTabID ? 1 : 0)
-                    .allowsHitTesting(tab.id == store.activeTabID)
-                    .accessibilityHidden(tab.id != store.activeTabID)
-                }
+            GeometryReader { proxy in
+                PaneMountLayer(store: store, full: CGRect(origin: .zero, size: proxy.size))
             }
             .padding(.top, 6)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .animation(.easeOut(duration: 0.18), value: store.activeTabID)
 
             if store.aiPanelVisible {
                 Divider()
@@ -1578,54 +2125,275 @@ struct WorkspaceMain: View {
             }
         }
         .animation(.easeOut(duration: 0.24), value: store.aiPanelVisible)
-        
     }
 }
 
-/// One mounted tab: its block stack over its live terminal.
+/// One pane's placement: which tab it belongs to, its frame, and whether that
+/// tab is currently the visible one.
+struct PaneMount: Identifiable {
+    let pane: Pane
+    let tab: TerminalTab
+    let rect: CGRect
+    let visible: Bool
+    var id: UUID { pane.id }
+}
+
+/// A divider's placement, carrying the tab and tree-path it adjusts.
+struct DividerMount: Identifiable {
+    let id: String
+    let tabID: UUID
+    let rect: CGRect
+    let axis: SplitAxis
+    let path: [Int]
+}
+
+/// Mounts every pane of every tab in one flat `ForEach` keyed by pane id, and
+/// positions each by the frame its tab's layout gives it. This is what keeps a
+/// shell alive across changes that a per-tab hierarchy could not: splitting a
+/// pane, resizing a divider — and moving a pane to another tab (breaking a split
+/// apart) — only change a pane's computed frame or its `tab`, never its identity
+/// or its place in the view tree, so its terminal is updated, never rebuilt.
+struct PaneMountLayer: View {
+    @ObservedObject var store: TerminalStore
+    let full: CGRect
+
+    var body: some View {
+        let mounts = computeMounts()
+        ZStack(alignment: .topLeading) {
+            ForEach(mounts.panes) { mount in
+                PaneHost(
+                    store: store,
+                    tab: mount.tab,
+                    pane: mount.pane,
+                    isTabVisible: mount.visible,
+                    tracker: store.blockTracker(for: mount.pane.id)
+                )
+                .frame(width: mount.rect.width, height: mount.rect.height)
+                .position(x: mount.rect.midX, y: mount.rect.midY)
+                // The active tab's panes fade to the front; the rest fade back.
+                // Opacity alone — no scale, which would keep AppKit re-running
+                // autolayout on the terminal every frame.
+                .opacity(mount.visible ? 1 : 0)
+                .allowsHitTesting(mount.visible)
+                .accessibilityHidden(!mount.visible)
+            }
+            ForEach(mounts.dividers) { divider in
+                PaneDivider(axis: divider.axis) { delta in
+                    store.adjustSplit(
+                        in: divider.tabID,
+                        path: divider.path,
+                        delta: delta,
+                        total: divider.axis == .row ? full.width : full.height
+                    )
+                }
+                .frame(width: divider.rect.width, height: divider.rect.height)
+                .position(x: divider.rect.midX, y: divider.rect.midY)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .animation(.easeInOut(duration: 0.22), value: store.activeTabID)
+    }
+
+    private func computeMounts() -> (panes: [PaneMount], dividers: [DividerMount]) {
+        var panes: [PaneMount] = []
+        var dividers: [DividerMount] = []
+        for tab in store.allTabs {
+            let visible = tab.id == store.activeTabID
+            let layout = PaneLayout.compute(tab.layout, in: full)
+            for pane in tab.panes {
+                panes.append(PaneMount(
+                    pane: pane,
+                    tab: tab,
+                    rect: layout.leaves[pane.id] ?? full,
+                    visible: visible
+                ))
+            }
+            // Only the visible tab's dividers need laying out — the rest are
+            // hidden and non-interactive anyway.
+            if visible {
+                for d in layout.dividers {
+                    dividers.append(DividerMount(
+                        id: "\(tab.id.uuidString)-\(d.id)",
+                        tabID: tab.id,
+                        rect: d.rect,
+                        axis: d.axis,
+                        path: d.path
+                    ))
+                }
+            }
+        }
+        return (panes, dividers)
+    }
+}
+
+/// One divider between two panes, with the path that locates the split it moves.
+struct PaneDividerFrame: Identifiable {
+    let id: String
+    let rect: CGRect
+    let axis: SplitAxis
+    let path: [Int]
+}
+
+/// Turns a pane tree plus a bounding rect into absolute frames for each leaf and
+/// each divider. Kept separate from the view so it stays a pure, testable step.
+enum PaneLayout {
+    static let dividerThickness: CGFloat = 8
+
+    static func compute(_ node: PaneNode, in rect: CGRect)
+        -> (leaves: [UUID: CGRect], dividers: [PaneDividerFrame]) {
+        var leaves: [UUID: CGRect] = [:]
+        var dividers: [PaneDividerFrame] = []
+        walk(node, in: rect, path: [], leaves: &leaves, dividers: &dividers)
+        return (leaves, dividers)
+    }
+
+    private static func walk(
+        _ node: PaneNode,
+        in rect: CGRect,
+        path: [Int],
+        leaves: inout [UUID: CGRect],
+        dividers: inout [PaneDividerFrame]
+    ) {
+        switch node {
+        case .leaf(let id):
+            leaves[id] = rect
+        case .split(let axis, let first, let second, let fraction):
+            let t = dividerThickness
+            let key = path.map(String.init).joined(separator: "-")
+            if axis == .row {
+                let firstW = max(0, (rect.width - t) * fraction)
+                let firstRect = CGRect(x: rect.minX, y: rect.minY, width: firstW, height: rect.height)
+                let secondRect = CGRect(x: rect.minX + firstW + t, y: rect.minY,
+                                        width: max(0, rect.width - firstW - t), height: rect.height)
+                dividers.append(PaneDividerFrame(
+                    id: "r-\(key)",
+                    rect: CGRect(x: rect.minX + firstW, y: rect.minY, width: t, height: rect.height),
+                    axis: .row, path: path))
+                walk(first, in: firstRect, path: path + [0], leaves: &leaves, dividers: &dividers)
+                walk(second, in: secondRect, path: path + [1], leaves: &leaves, dividers: &dividers)
+            } else {
+                let firstH = max(0, (rect.height - t) * fraction)
+                let firstRect = CGRect(x: rect.minX, y: rect.minY, width: rect.width, height: firstH)
+                let secondRect = CGRect(x: rect.minX, y: rect.minY + firstH + t,
+                                        width: rect.width, height: max(0, rect.height - firstH - t))
+                dividers.append(PaneDividerFrame(
+                    id: "c-\(key)",
+                    rect: CGRect(x: rect.minX, y: rect.minY + firstH, width: rect.width, height: t),
+                    axis: .column, path: path))
+                walk(first, in: firstRect, path: path + [0], leaves: &leaves, dividers: &dividers)
+                walk(second, in: secondRect, path: path + [1], leaves: &leaves, dividers: &dividers)
+            }
+        }
+    }
+}
+
+/// The draggable strip between two panes. Reports incremental drag deltas along
+/// its axis; the store turns those into a new split fraction.
+struct PaneDivider: View {
+    let axis: SplitAxis
+    let onDrag: (CGFloat) -> Void
+    @State private var last: CGFloat = 0
+
+    var body: some View {
+        Rectangle()
+            .fill(Color.white.opacity(0.001))
+            .overlay {
+                Rectangle().fill(Color.white.opacity(0.06))
+                    .frame(
+                        width: axis == .row ? 1 : nil,
+                        height: axis == .column ? 1 : nil
+                    )
+            }
+            .contentShape(Rectangle())
+            .onHover { inside in
+                if inside {
+                    (axis == .row ? NSCursor.resizeLeftRight : NSCursor.resizeUpDown).set()
+                } else {
+                    NSCursor.arrow.set()
+                }
+            }
+            .gesture(
+                DragGesture(minimumDistance: 1)
+                    .onChanged { value in
+                        let current = axis == .row ? value.translation.width : value.translation.height
+                        onDrag(current - last)
+                        last = current
+                    }
+                    .onEnded { _ in last = 0 }
+            )
+    }
+}
+
+/// One pane: its block stack over its live terminal, plus the focus ring that
+/// marks the active pane in a split.
 ///
-/// It observes the tracker, which is the whole point — `wantsFocus` is derived
-/// from tracker state, so when a command starts (or a full-screen program takes
-/// over) this re-renders and `TerminalSessionView` grabs the keyboard. The
-/// parent workspace does not observe the tracker, so computing `wantsFocus`
-/// there left it stale until an unrelated re-render (like switching tabs) — the
-/// reason a TUI would not accept input until you switched away and back.
-struct MountedTab: View {
+/// It observes its tracker, which is the point — `wantsFocus` is derived from
+/// tracker state, so when a command starts (or a full-screen program takes over)
+/// this re-renders and the terminal grabs the keyboard.
+struct PaneHost: View {
     let store: TerminalStore
     let tab: TerminalTab
+    let pane: Pane
+    let isTabVisible: Bool
     @ObservedObject var tracker: BlockTracker
-    let isVisible: Bool
+
+    private var isActivePane: Bool { tab.activePaneID == pane.id }
+    /// The terminal is "active" (and may take the keyboard) only when its tab is
+    /// on screen and it is the focused pane.
+    private var isLive: Bool { isTabVisible && isActivePane }
 
     var body: some View {
         BlockStack(
             tracker: tracker,
             terminal: TerminalSessionView(
-                tabID: tab.id,
-                isActive: isVisible,
-                // The editor owns the keyboard until a command runs long enough
-                // to be shown live; the terminal takes it back then, for a
-                // full-screen program, or for a shell we could not instrument.
-                wantsFocus: tracker.runningVisible
+                paneID: pane.id,
+                isActive: isLive,
+                // The terminal takes the keyboard while any command is running
+                // that has not been confirmed a batch job — that covers a TUI
+                // (which may still be entering raw mode) and the ambiguous window
+                // before classification — as well as the alternate screen or a
+                // shell we could not instrument. Once a batch command is
+                // confirmed the keyboard returns to the composer, so you can
+                // queue the next command while it runs. Gated by `isLive` so only
+                // the focused pane of the visible tab ever pulls focus.
+                wantsFocus: isLive && ((tracker.runningVisible && !tracker.batchConfirmed)
                     || tracker.isAlternateScreen
-                    || !tracker.isIntegrationActive,
+                    || !tracker.isIntegrationActive),
+                initialDirectory: pane.directory ?? ShellInfo.homePath,
                 tracker: tracker,
-                onTitle: { store.updateTitle($0, for: tab.id) },
-                onDirectory: { store.updateDirectory($0, for: tab.id) },
-                onExit: { store.markExited(for: tab.id, code: $0) }
+                onTitle: { store.updateTitle($0, for: pane.id) },
+                onDirectory: { store.updateDirectory($0, for: pane.id) },
+                onExit: { store.markExited(for: pane.id, code: $0) }
             )
         )
+        // A click on an inactive pane focuses it. The catcher sits only over
+        // inactive panes, so the active pane's terminal keeps every click — you
+        // click once to focus a pane, then interact with it normally.
+        .overlay {
+            if isTabVisible && tab.isSplit && !isActivePane {
+                Color.white.opacity(0.06)
+                    .contentShape(Rectangle())
+                    .onTapGesture { store.focusPane(pane.id) }
+            }
+        }
+        // Only splits get a focus ring — a lone pane needs no "which one" cue.
+        .overlay {
+            if isTabVisible && tab.isSplit {
+                RoundedRectangle(cornerRadius: 4)
+                    .strokeBorder(
+                        isActivePane ? Color.accentColor.opacity(0.55) : Color.clear,
+                        lineWidth: 1.5
+                    )
+                    .allowsHitTesting(false)
+                    .animation(.easeOut(duration: 0.15), value: isActivePane)
+            }
+        }
     }
-}
-
-enum SidebarView: String {
-    case files
-    case sourceControl
 }
 
 struct WorkspaceSidebar: View {
     @ObservedObject var tracker: BlockTracker
 
-    @State private var activeView: SidebarView = .files
     @State private var searchPresented = false
     @StateObject private var explorerModel = FileExplorerModel()
 
@@ -1708,45 +2476,7 @@ struct WorkspaceSidebar: View {
                 }
             }
 
-            ZStack {
-                if activeView == .files {
-                    FileExplorerPreview(model: explorerModel)
-                        .transition(.opacity)
-                } else {
-                    VStack(spacing: 8) {
-                        Image(systemName: "checkmark.circle")
-                            .font(.system(size: 20))
-                            .foregroundStyle(.secondary)
-                        Text("No changes")
-                            .font(.system(size: 12, weight: .medium))
-                        Text("Source control will appear here")
-                            .font(.system(size: 11))
-                            .foregroundStyle(.secondary)
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .transition(.opacity)
-                }
-            }
-            .animation(.easeOut(duration: 0.18), value: activeView)
-
-            Group {
-                HStack(spacing: 3) {
-                    SidebarRailButton(title: "Files", systemName: "folder", isActive: activeView == .files) {
-                        activeView = .files
-                    }
-
-                    SidebarRailButton(title: "Source Control", systemName: "arrow.triangle.branch", isActive: activeView == .sourceControl) {
-                        activeView = .sourceControl
-                    }
-                }
-            }
-            .padding(5)
-            .frame(height: 36)
-            .overlay(alignment: .top) {
-                Rectangle()
-                    .fill(Color.white.opacity(0.07))
-                    .frame(height: 1)
-            }
+            FileExplorerPreview(model: explorerModel)
         }
         .background(Surface.chrome)
         .onChange(of: tracker.currentDirectory, initial: true) { _, directory in
@@ -1889,30 +2619,6 @@ struct FileExplorerRows: View {
                 )
             }
         }
-    }
-}
-
-struct SidebarRailButton: View {
-    let title: String
-    let systemName: String
-    let isActive: Bool
-    let action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            Label(title, systemImage: systemName)
-                .font(.system(size: 10, weight: .medium))
-                .frame(maxWidth: .infinity)
-                // Enough vertical room that the capsule is a pill rather than
-                // a squashed oval.
-                .padding(.vertical, 7)
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(PressableStyle())
-        .foregroundStyle(isActive ? Color.primary : Color.secondary)
-        .background(Capsule().fill(Color.white.opacity(isActive ? 0.08 : 0)))
-        .clipShape(Capsule())
-        .animation(.easeOut(duration: 0.18), value: isActive)
     }
 }
 
@@ -2404,19 +3110,118 @@ struct AIMessageBubble: View {
     let message: AIMessage
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: 6) {
             Text(message.role == .user ? "You" : "Agent")
                 .font(.system(size: 10, weight: .semibold))
                 .foregroundStyle(message.role == .user ? .blue : .purple)
-            Text(message.content)
-                .font(.system(size: 12))
-                .textSelection(.enabled)
-                .fixedSize(horizontal: false, vertical: true)
+
+            ForEach(Array(segments.enumerated()), id: \.offset) { _, segment in
+                switch segment {
+                case .prose(let text):
+                    Text(text)
+                        .font(.system(size: 12))
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                case .code(let code):
+                    AICodeBlock(code: code)
+                }
+            }
         }
         .padding(9)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(message.role == .user ? Color.blue.opacity(0.10) : Color.white.opacity(0.055))
         .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+
+    /// User bubbles are our own compact labels, never worth parsing for code;
+    /// assistant replies are split so commands become runnable code blocks.
+    private var segments: [AIMessageSegment] {
+        message.role == .user
+            ? [.prose(message.content)]
+            : AIMessageSegment.parse(message.content)
+    }
+}
+
+/// A fenced code block from an assistant reply, with actions to copy it or drop
+/// it into the composer for review. The AI never runs anything itself.
+struct AICodeBlock: View {
+    let code: String
+    @EnvironmentObject private var store: TerminalStore
+    @State private var copied = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 10) {
+                Spacer()
+                Button {
+                    Pasteboard.copy(code)
+                    copied = true
+                } label: {
+                    Label(copied ? "Copied" : "Copy", systemImage: copied ? "checkmark" : "doc.on.doc")
+                        .font(.system(size: 10, weight: .medium))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                Button {
+                    store.insertIntoComposer(code)
+                } label: {
+                    Label("Insert", systemImage: "arrow.down.to.line")
+                        .font(.system(size: 10, weight: .medium))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.blue)
+                .help("Put this command in the composer to review and run")
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+
+            Text(code)
+                .font(.system(size: 11.5, design: .monospaced))
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 9)
+                .padding(.bottom, 8)
+        }
+        .background(Color.black.opacity(0.28))
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+    }
+}
+
+/// A piece of an assistant reply: plain prose, or a fenced code block.
+enum AIMessageSegment {
+    case prose(String)
+    case code(String)
+
+    /// Splits Markdown-ish text on ``` fences. An unterminated fence treats the
+    /// remainder as code, which is the safer guess for a cut-off command.
+    static func parse(_ content: String) -> [AIMessageSegment] {
+        var segments: [AIMessageSegment] = []
+        var prose: [String] = []
+        var code: [String] = []
+        var inCode = false
+
+        func flushProse() {
+            let text = prose.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+            if !text.isEmpty { segments.append(.prose(text)) }
+            prose.removeAll()
+        }
+        func flushCode() {
+            let text = code.joined(separator: "\n").trimmingCharacters(in: .newlines)
+            if !text.isEmpty { segments.append(.code(text)) }
+            code.removeAll()
+        }
+
+        for line in content.split(separator: "\n", omittingEmptySubsequences: false).map(String.init) {
+            if line.trimmingCharacters(in: .whitespaces).hasPrefix("```") {
+                if inCode { flushCode() } else { flushProse() }
+                inCode.toggle()
+                continue
+            }
+            if inCode { code.append(line) } else { prose.append(line) }
+        }
+        if inCode { flushCode() } else { flushProse() }
+        return segments.isEmpty ? [.prose(content)] : segments
     }
 }
 
@@ -2546,7 +3351,7 @@ struct TerminalSettingsView: View {
             Section {
                 HStack {
                     Text("Font size")
-                    Slider(value: $preferences.terminalFontSize, in: 10...22, step: 1)
+                    Slider(value: $preferences.terminalFontSize, in: AppPreferences.fontSizeRange, step: 1)
                     Text("\(Int(preferences.terminalFontSize)) pt")
                         .font(.system(size: 11, design: .monospaced))
                         .frame(width: 48, alignment: .trailing)
@@ -2725,6 +3530,10 @@ struct AgentsSettingsView: View {
                     Text("Architect").tag("Architect")
                     Text("Custom").tag("Custom")
                 }
+                Text(AIGateway.personaPrompt(preferences.selectedAgent))
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             } header: {
                 SettingsSectionHeader(title: "Agents", subtitle: "Choose the persona and instructions used by the AI pane.")
             }
@@ -2820,9 +3629,13 @@ struct SettingsSectionHeader: View {
 
 struct TerminalSessionView: NSViewRepresentable {
     @EnvironmentObject private var preferences: AppPreferences
-    let tabID: TerminalTab.ID
+    let paneID: Pane.ID
     let isActive: Bool
     let wantsFocus: Bool
+    /// Where the shell should start — a restored pane's last directory, or the
+    /// directory inherited from the pane a split was opened from. Falls back to
+    /// home if it is not a directory that exists on this machine.
+    let initialDirectory: String
     let tracker: BlockTracker
     let onTitle: (String) -> Void
     let onDirectory: (String?) -> Void
@@ -2830,6 +3643,17 @@ struct TerminalSessionView: NSViewRepresentable {
 
     func makeCoordinator() -> Coordinator {
         Coordinator(onTitle: onTitle, onDirectory: onDirectory, onExit: onExit)
+    }
+
+    /// The directory a shell can actually be started in: the requested one when
+    /// it exists locally, home otherwise. A restored or inherited path may be
+    /// gone, or belong to a remote host, in which case chdir would fail.
+    private static func startDirectory(_ requested: String) -> String {
+        var isDir: ObjCBool = false
+        if FileManager.default.fileExists(atPath: requested, isDirectory: &isDir), isDir.boolValue {
+            return requested
+        }
+        return ShellInfo.homePath
     }
 
     func makeNSView(context: Context) -> SwifttyTerminalView {
@@ -2863,7 +3687,9 @@ struct TerminalSessionView: NSViewRepresentable {
         // cannot instrument just start normally and produce no blocks.
         var arguments = ["-l"]
         var execName = "-" + (shell as NSString).lastPathComponent
-        if let injection = ShellIntegration.prepare(shellPath: shell, tabID: tabID) {
+        // Each pane's shell integration lives in its own namespace, keyed by the
+        // pane id, so split panes never trample one another's marker files.
+        if let injection = ShellIntegration.prepare(shellPath: shell, tabID: paneID) {
             environment.merge(injection.environment) { _, new in new }
             if !injection.arguments.isEmpty { arguments = injection.arguments }
             if let name = injection.execName { execName = name }
@@ -2878,7 +3704,7 @@ struct TerminalSessionView: NSViewRepresentable {
             args: arguments,
             environment: environment.map { $0.key + "=" + $0.value },
             execName: execName,
-            currentDirectory: ShellInfo.homePath
+            currentDirectory: Self.startDirectory(initialDirectory)
         )
 
         terminal.setCursorBlink(preferences.terminalCursorBlink)

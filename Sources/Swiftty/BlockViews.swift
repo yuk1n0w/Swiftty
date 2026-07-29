@@ -242,6 +242,13 @@ struct BlockStack<Terminal: View>: View {
         tracker.isIntegrationActive && !tracker.isAlternateScreen
     }
 
+    /// Whether this pane is the one taking input — the active pane of the active
+    /// tab. Exactly one mounted `BlockStack` is ever the active pane, so this is
+    /// what keeps the other panes' composers from fighting for the keyboard.
+    private var isActivePane: Bool {
+        store.activeBlockTracker === tracker
+    }
+
     var body: some View {
         GeometryReader { proxy in
             // The terminal is deliberately NOT inside the scroll view, and
@@ -266,9 +273,17 @@ struct BlockStack<Terminal: View>: View {
                 // of its own, and a slot with any height would show its own
                 // full-width background as a band beneath the card.
                 liveBlock(viewport: proxy.size.height)
-                    .frame(height: showsBlocks
-                        ? (tracker.runningVisible ? runningHeight(viewport: proxy.size.height) : 0)
-                        : nil)
+                    .frame(height: showsBlocks ? slotHeight(viewport: proxy.size.height) : nil)
+
+                // A batch command (brew, a build) keeps the composer at the
+                // bottom, below its output — you can queue the next command
+                // while it runs. An interactive TUI takes the whole view and
+                // the composer floats away (handled in the overlay below).
+                if showsBlocks, batchRunning {
+                    composer
+                        .frame(height: composerHeight)
+                        .transition(.opacity)
+                }
             }
             .overlay(alignment: .top) {
                 if store.searchVisible {
@@ -288,26 +303,85 @@ struct BlockStack<Terminal: View>: View {
             .onChange(of: tracker.isSubmitting) { _, submitting in
                 if !submitting { editorFocusRequests += 1 }
             }
+            // An AI-suggested command lands in the active tab's composer, ready
+            // to review and run. Only the visible tab claims it, then clears it.
+            .onChange(of: store.composerInjection) { _, injection in
+                guard let injection, store.activeBlockTracker === tracker else { return }
+                draft = injection
+                editorFocusRequests += 1
+                store.composerInjection = nil
+            }
+            // Clicking a pane makes it the active pane; the caret should follow,
+            // so its composer grabs the keyboard the moment it becomes active.
+            .onChange(of: isActivePane) { _, active in
+                if active { editorFocusRequests += 1 }
+            }
+            // Entering or leaving a swiftified subshell (SSH, a container) swaps
+            // the whole prompt out from under the composer; pull the caret back so
+            // the first thing you type after an `ssh` lands in the input, not the
+            // void — the cause of the "beep, nothing happens" over SSH.
+            .onChange(of: tracker.subshell) { _, _ in
+                editorFocusRequests += 1
+            }
             .animation(.easeOut(duration: 0.2), value: store.searchVisible)
             .animation(.easeOut(duration: 0.2), value: tracker.runningVisible)
             .animation(.easeOut(duration: 0.18), value: historyOpen)
             .overlay(alignment: .bottom) {
-                // Stays put through a quick command instead of fading out and
-                // back — it only yields to the live terminal once a command has
-                // run long enough to be shown. That is what stopped the input
-                // bar flickering on every submit.
+                // At a prompt the composer floats over the blocks. It stays put
+                // through a quick command instead of fading out and back — it
+                // only yields once a command runs long enough to be shown, which
+                // is what stopped the input bar flickering on every submit. A
+                // batch command's composer is in the flow above, not here.
                 if showsBlocks, !tracker.runningVisible {
-                    VStack(spacing: 0) {
-                        if historyOpen, !historyWindow.isEmpty {
-                            historyPalette
-                                .transition(.move(edge: .bottom).combined(with: .opacity))
-                        }
-                        promptEditor
-                    }
-                    .transition(.opacity)
+                    composer
+                        .transition(.opacity)
                 }
             }
         }
+    }
+
+    /// The command line and, above it while browsing, the history palette.
+    private var composer: some View {
+        VStack(spacing: 0) {
+            if historyOpen, !historyWindow.isEmpty {
+                historyPalette
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+            promptEditor
+        }
+    }
+
+    /// A batch (non-interactive) command has been confirmed and is visible.
+    ///
+    /// Confirmation lags the command's appearance on purpose — see
+    /// `BlockTracker.batchConfirmed`. Until it lands, a running command is
+    /// treated as a plain full-screen program (the neutral case below), so a TUI
+    /// that is slow to enter raw mode never flashes the composer.
+    private var batchRunning: Bool {
+        tracker.runningVisible && tracker.batchConfirmed
+    }
+
+    /// An interactive TUI is running and has taken the view — or a batch command
+    /// is momentarily at a raw prompt. Yields back to the composer once the
+    /// command has been canonical again for a beat (see `interactiveTakeover`).
+    private var interactiveRunning: Bool {
+        tracker.runningVisible && tracker.interactiveTakeover
+    }
+
+    /// Height of the live slot. Full window for a TUI or a not-yet-classified
+    /// command; the window minus the composer once a batch job is confirmed, so
+    /// its output sits above the input rather than under it.
+    private func slotHeight(viewport: CGFloat) -> CGFloat {
+        guard tracker.runningVisible else { return 0 }
+        let full = runningHeight(viewport: viewport)
+        return batchRunning ? max(160, full - composerHeight) : full
+    }
+
+    /// Fixed height of the terminal itself. Full-window-minus-header at a prompt
+    /// and for an interactive TUI; shrunk by the composer for a batch command.
+    private func terminalContentHeight(viewport: CGFloat) -> CGFloat {
+        let full = runningHeight(viewport: viewport) - runningHeaderHeight
+        return batchRunning ? max(120, full - composerHeight) : full
     }
 
     private var searchQuery: String {
@@ -470,11 +544,16 @@ struct BlockStack<Terminal: View>: View {
                         onAcceptSuggestion: { draft += suggestion },
                         onEscape: dismissHistory,
                         focusRequests: editorFocusRequests,
-                        // Stops the composer stealing focus back from the
-                        // terminal while it fades out — whether the terminal
-                        // took over for a running command or a full-screen
-                        // program on the alternate screen.
-                        canClaimFocus: !tracker.runningVisible && !tracker.isAlternateScreen,
+                        // The composer takes the keyboard at a prompt and once a
+                        // batch command is confirmed (so you can queue the next
+                        // one). While a command is running but not yet classified
+                        // it holds off — that window might be a TUI still entering
+                        // raw mode, and stealing focus would leave it unnavigable.
+                        // Gated by `isActivePane` so that in a split only the
+                        // focused pane's composer ever holds the keyboard.
+                        canClaimFocus: isActivePane
+                            && (!tracker.runningVisible || tracker.batchConfirmed)
+                            && !tracker.isAlternateScreen,
                         onComplete: completeToken,
                         onHeightChange: { editorHeight = $0 }
                     )
@@ -848,11 +927,13 @@ struct BlockStack<Terminal: View>: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .overlay(alignment: .topLeading) {
                     // Slot height minus the header, so all of the terminal's
-                    // rows fit; still one constant size whether running or at a
-                    // prompt, so the pty is never resized mid-command.
+                    // rows fit. Kept at the full (interactive) size at a prompt
+                    // so a program's first frame draws into a full-size terminal
+                    // — the fastfetch fix — and only shrinks by the composer's
+                    // height once a batch command is actually shown.
                     terminal
                         .frame(height: showsBlocks
-                            ? runningHeight(viewport: viewport) - runningHeaderHeight
+                            ? terminalContentHeight(viewport: viewport)
                             : nil)
                         .opacity(isRunning || !showsBlocks ? 1 : 0)
                         .allowsHitTesting(isRunning || !showsBlocks)
@@ -878,6 +959,7 @@ private struct BlockView: View {
     var searchQuery: String = ""
     var isCurrentMatch: Bool = false
     @EnvironmentObject private var preferences: AppPreferences
+    @EnvironmentObject private var store: TerminalStore
 
     @State private var isHovered = false
 
@@ -917,7 +999,7 @@ private struct BlockView: View {
         }
         .onHover { isHovered = $0 }
         .onTapGesture { tracker.select(isSelected ? nil : block.id) }
-        .contextMenu { BlockMenu(block: block, tracker: tracker) }
+        .contextMenu { BlockMenu(block: block, tracker: tracker, store: store) }
     }
 
     private var header: some View {
@@ -939,10 +1021,44 @@ private struct BlockView: View {
             Spacer(minLength: 0)
 
             if isHovered {
-                BlockMenuButton(block: block, tracker: tracker)
+                HStack(spacing: 5) {
+                    // Failures get a one-click route to the AI, which is when you
+                    // most want it; anything can still be explained via the menu.
+                    if block.state.failed {
+                        BlockAIButton(title: "Fix", icon: "wrench.and.screwdriver") {
+                            store.askAI(about: block, tracker: tracker, mode: .fix)
+                        }
+                    }
+                    BlockMenuButton(block: block, tracker: tracker, store: store)
+                }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// A compact pill action shown on a block on hover (currently "Fix").
+private struct BlockAIButton: View {
+    let title: String
+    let icon: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 3) {
+                Image(systemName: icon)
+                Text(title)
+            }
+            .font(.system(size: 11, weight: .medium))
+            .padding(.horizontal, 8)
+            .frame(height: 22)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.orange)
+        .background(Color.orange.opacity(0.14))
+        .clipShape(Capsule())
+        .help("Diagnose and fix this command with AI")
     }
 }
 
@@ -1012,10 +1128,11 @@ private struct BlockOutput: View {
 private struct BlockMenuButton: View {
     let block: CommandBlock
     @ObservedObject var tracker: BlockTracker
+    let store: TerminalStore
 
     var body: some View {
         Menu {
-            BlockMenu(block: block, tracker: tracker)
+            BlockMenu(block: block, tracker: tracker, store: store)
         } label: {
             Image(systemName: "ellipsis")
                 .font(.system(size: 12, weight: .semibold))
@@ -1035,6 +1152,7 @@ private struct BlockMenuButton: View {
 private struct BlockMenu: View {
     let block: CommandBlock
     @ObservedObject var tracker: BlockTracker
+    let store: TerminalStore
 
     var body: some View {
         Button("Copy Command") { Pasteboard.copy(block.command) }
@@ -1044,6 +1162,15 @@ private struct BlockMenu: View {
         }
         Divider()
         Button("Run Again") { tracker.rerun(block.command) }
+        Divider()
+        Button("Explain with AI") {
+            store.askAI(about: block, tracker: tracker, mode: .explain)
+        }
+        if block.state.failed {
+            Button("Fix with AI") {
+                store.askAI(about: block, tracker: tracker, mode: .fix)
+            }
+        }
     }
 }
 
