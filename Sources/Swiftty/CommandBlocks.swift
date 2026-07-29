@@ -130,7 +130,9 @@ final class BlockTracker: ObservableObject {
             runningVisibleTask?.cancel()
             if runningBlock == nil {
                 runningVisible = false
+                endInteractiveWatch()
             } else if oldValue == nil {
+                beginInteractiveWatch()
                 runningVisibleTask = Task { [weak self] in
                     try? await Task.sleep(for: .milliseconds(160))
                     guard !Task.isCancelled, let self, self.runningBlock != nil else { return }
@@ -141,6 +143,7 @@ final class BlockTracker: ObservableObject {
                     self.focusTerminal()
                 }
             }
+            updateInteractive()
         }
     }
     /// True once a running command has lasted long enough to be worth showing
@@ -152,6 +155,45 @@ final class BlockTracker: ObservableObject {
     @Published private(set) var isIntegrationActive = false
     /// True while a full-screen program (vim, htop, less) owns the screen.
     @Published private(set) var isAlternateScreen = false
+    /// True while the running program is interactive — it put the tty into raw
+    /// mode to read keystrokes itself (every TUI: vim, htop, Claude Code…), or
+    /// took the alternate screen. A batch command like `brew install` leaves the
+    /// tty canonical. The composer stays at the bottom for batch commands and
+    /// hides only for interactive ones.
+    ///
+    /// Raw mode is the reliable tell: the terminal-mode flags are not, because
+    /// zsh turns bracketed paste on at its own prompt. And it is checked only
+    /// while a command runs — the shell's own line editor is raw too, but that
+    /// is not a running command.
+    @Published private(set) var isInteractive = false
+    /// True while an interactive TUI should own the whole view — it is in raw
+    /// mode or the alternate screen now, or was until a moment ago. The trailing
+    /// grace is what lets a batch command's brief prompt (Homebrew's proceed
+    /// `[y/n]`, which flips the tty raw to read one key) take the keyboard for
+    /// that question without the composer staying gone once the command drops
+    /// back to streaming output — while still not flickering for a TUI that dips
+    /// to canonical for an instant.
+    @Published private(set) var interactiveTakeover = false
+    /// True once a running command has *settled* into plain canonical output for
+    /// long enough to be judged a batch job — an install, a build — rather than
+    /// a TUI still starting up or mid-prompt. Claude Code, for one, does not
+    /// switch the tty to raw until roughly a second after launch, so committing
+    /// to the composer-at-bottom layout the instant a command appears would
+    /// wrongly show it for a TUI. Only when this is set does the composer sit at
+    /// the bottom below the command's output.
+    @Published private(set) var batchConfirmed = false
+    private var interactiveWatch: Task<Void, Never>?
+    /// 200ms ticks the current command has been running, and consecutive ticks
+    /// it has been canonical (non-raw). `sawInteractive` gates the takeover's
+    /// trailing grace so a command that has never been raw drops to batch at once.
+    private var runTicks = 0
+    private var canonicalStreak = 0
+    private var sawInteractive = false
+    /// Canonical ticks before the takeover yields back to the composer (~1s), and
+    /// running ticks before a still-canonical command is called a batch job
+    /// (~1.6s, comfortably past a TUI's raw-mode start-up window).
+    private let canonicalDropTicks = 5
+    private let batchStartupTicks = 8
     /// Set while a subshell — an SSH session, a container — is producing
     /// blocks of its own, and labelled with the shell that answered.
     @Published private(set) var subshell: String?
@@ -230,7 +272,102 @@ final class BlockTracker: ObservableObject {
             if alternate { focusTerminal() }
         }
 
+        updateInteractive()
         updateIdleHeight(view: view)
+    }
+
+    /// Refreshes `isInteractive` from the pty's line-discipline mode, and lets a
+    /// TUI seize the takeover the instant it goes raw (rather than waiting for the
+    /// next poll tick). Interactive only means anything while a command runs, so a
+    /// quiet prompt — where the shell's own line editor is raw — reads as not
+    /// interactive.
+    func updateInteractive() {
+        // Raw mode is the tell for a local TUI — but not inside an SSH session or
+        // container, where the ssh/exec client holds the *local* tty raw for the
+        // whole session no matter what the far end is doing. There, raw mode is
+        // always on, so it would flag every remote `ls` as a full-screen takeover
+        // and yank the composer (and the keyboard) away on every command. Once a
+        // subshell is swiftified, only the alternate screen marks a remote TUI.
+        let rawIsMeaningful = subshell == nil
+        let interactive = runningBlock != nil
+            && (isAlternateScreen || (rawIsMeaningful && terminalIsRaw()))
+        if interactive != isInteractive { isInteractive = interactive }
+        if interactive {
+            sawInteractive = true
+            canonicalStreak = 0
+            if !interactiveTakeover { interactiveTakeover = true }
+            // A TUI outed itself: it is not sitting there as a batch job.
+            if batchConfirmed { batchConfirmed = false }
+        }
+    }
+
+    /// Resets interactivity state for a fresh command and starts polling the tty
+    /// mode a few times a second while it runs.
+    ///
+    /// A repaint is not a dependable trigger for spotting raw mode. Claude Code
+    /// flips the tty to raw about a second after launch and then rests on a
+    /// static screen — no repaint follows to notice the change, so relying on
+    /// `terminalStateChanged` alone leaves it stuck in the batch layout. And the
+    /// poll is what times the *exits* from raw: a command has to be canonical for
+    /// a sustained stretch before the composer returns, so Homebrew's momentary
+    /// `[y/n]` does not leave the composer gone for the rest of the download. The
+    /// tcgetattr is a handful of times a second and stops the moment the command
+    /// ends.
+    private func beginInteractiveWatch() {
+        runTicks = 0
+        canonicalStreak = 0
+        sawInteractive = false
+        interactiveTakeover = false
+        batchConfirmed = false
+        interactiveWatch?.cancel()
+        interactiveWatch = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self, self.runningBlock != nil else { return }
+                self.interactiveTick()
+                try? await Task.sleep(for: .milliseconds(200))
+            }
+        }
+    }
+
+    /// One poll tick: sample the tty mode and recompute the takeover / batch
+    /// classification with hysteresis on both edges.
+    private func interactiveTick() {
+        updateInteractive()
+        runTicks += 1
+        if isInteractive {
+            canonicalStreak = 0
+        } else {
+            canonicalStreak += 1
+        }
+
+        // Hold the takeover through a brief return to canonical (a batch job's
+        // prompt, a TUI shelling out) and only yield once canonical has held.
+        let takeover = isInteractive
+            || (sawInteractive && canonicalStreak < canonicalDropTicks)
+        if takeover != interactiveTakeover { interactiveTakeover = takeover }
+
+        // Not (any longer) a takeover, and it has been running plainly for a
+        // beat: it is a batch job, so seat the composer at the bottom.
+        let batch = !takeover && runTicks >= batchStartupTicks
+        if batch != batchConfirmed { batchConfirmed = batch }
+    }
+
+    private func endInteractiveWatch() {
+        interactiveWatch?.cancel()
+        interactiveWatch = nil
+        interactiveTakeover = false
+        batchConfirmed = false
+        isInteractive = false
+    }
+
+    /// Whether the tty is in raw mode — canonical input off. On a pty the master
+    /// reflects the slave's mode, so tcgetattr on our end sees what the child
+    /// program set.
+    private func terminalIsRaw() -> Bool {
+        guard let fd = terminalView?.process?.childfd, fd >= 0 else { return false }
+        var settings = termios()
+        guard tcgetattr(fd, &settings) == 0 else { return false }
+        return (settings.c_lflag & tcflag_t(ICANON)) == 0
     }
 
     /// Sizes the live terminal to the prompt it is actually showing, so an idle
@@ -262,11 +399,17 @@ final class BlockTracker: ObservableObject {
     func submit(_ command: String) {
         guard let view = terminalView else { return }
         isSubmitting = true
-        // Ctrl-U first, to kill anything already sitting in the shell's line
-        // buffer. Stray keystrokes should never reach it now that the editor
-        // holds focus, but if any ever do they would silently prefix the
-        // command, and that failure is invisible until the shell rejects it.
-        view.send(txt: "\u{15}" + command + "\n")
+        // A space, then Ctrl-U, to kill anything already sitting in the shell's
+        // line buffer. Stray keystrokes should never reach it now that the editor
+        // holds focus, but if any ever do they would silently prefix the command,
+        // and that failure is invisible until the shell rejects it. The leading
+        // space is what stops the alert sound on every send: Ctrl-U on an *empty*
+        // line — the normal case, since the editor holds the command — is an
+        // error readline answers with a bell, but with a space to discard there
+        // is always something to kill, so it clears the line silently. The space
+        // is killed along with any stray input, so the command still runs clean
+        // and unprefixed (and is not treated as a HIST_IGNORE_SPACE line).
+        view.send(txt: " \u{15}" + command + "\n")
         // Focus is not handed to the terminal here: the composer stays put and
         // keeps the keyboard, so a quick command never disturbs it. The
         // terminal takes over only once the command has run long enough to be
@@ -383,6 +526,18 @@ final class BlockTracker: ObservableObject {
     func clearHistory() {
         blocks.removeAll()
         selectedBlockID = nil
+    }
+
+    /// Resets the terminal emulator to a clean slate — the cure for a screen left
+    /// garbled by a crashed full-screen program (wrong colours, a hidden cursor,
+    /// a stuck alternate buffer). It does not signal the shell, so a running
+    /// program keeps running; it just repairs how the terminal draws.
+    func resetTerminal() {
+        if let view = terminalView {
+            view.terminal?.resetToInitialState()
+            view.setNeedsDisplay(view.bounds)
+        }
+        clearHistory()
     }
 
     /// The shell's working directory as an absolute path, for completing
@@ -523,21 +678,25 @@ final class BlockTracker: ObservableObject {
     /// into a password or passphrase prompt.
     private func watchForSubshell(command: String) {
         subshellWatch?.cancel()
-        guard Self.opensInteractiveSession(command) else { return }
+        guard let host = Self.interactiveSSHHost(command) else { return }
 
         subshellWatch = Task { [weak self] in
             var previous: String?
-            // Roughly twelve seconds, enough for a slow connection and a
-            // remote rc file, then give up rather than fire into whatever the
-            // session has become.
-            for _ in 0..<40 {
+            // Up to a minute, not twelve seconds: logging in to a remote host can
+            // take a while — a slow link, a password or 2FA prompt typed by hand,
+            // a long MOTD — and the old ceiling gave up before the remote prompt
+            // ever appeared, so the session never got swiftified. The watcher is
+            // cancelled the moment the command ends, so this only runs while an
+            // interactive session is genuinely still opening.
+            for _ in 0..<200 {
                 try? await Task.sleep(for: .milliseconds(300))
                 guard !Task.isCancelled, let self, self.subshell == nil else { return }
 
                 let line = self.lastVisibleLine()
-                // Two identical samples means output has stopped arriving.
+                // Two identical samples means output has stopped arriving; the
+                // prompt check keeps the hooks out of a password or yes/no prompt.
                 if line == previous, Self.looksLikePrompt(line) {
-                    self.installSubshellHooks()
+                    self.installSubshellHooks(named: host)
                     return
                 }
                 previous = line
@@ -545,11 +704,13 @@ final class BlockTracker: ObservableObject {
         }
     }
 
-    /// True for `ssh host`, false for `ssh host -- some command`, which runs
-    /// and exits without ever presenting a prompt.
-    private static func opensInteractiveSession(_ command: String) -> Bool {
+    /// The host `ssh host` opens an interactive session to, or nil. Nil for
+    /// `ssh host -- some command`, which runs and exits without ever presenting a
+    /// prompt. A `user@` prefix is dropped so the chip reads as the host — or the
+    /// SSH-config alias — alone: `ssh yukino@rhel` shows as `rhel`.
+    static func interactiveSSHHost(_ command: String) -> String? {
         let words = command.split(separator: " ").map(String.init)
-        guard let first = words.first, first == "ssh" else { return false }
+        guard let first = words.first, first == "ssh" else { return nil }
         // Flags and their values, then exactly one host, is the interactive
         // form. Anything trailing the host is a remote command.
         var operands: [String] = []
@@ -566,7 +727,8 @@ final class BlockTracker: ObservableObject {
             }
             index += 1
         }
-        return operands.count == 1
+        guard operands.count == 1, let host = operands.first else { return nil }
+        return host.split(separator: "@").last.map(String.init) ?? host
     }
 
     /// Prompt-ending characters. The plain-shell set (`$ % # >`) plus the
@@ -634,9 +796,11 @@ final class BlockTracker: ObservableObject {
     }
 
     /// Installs the hooks on demand, for a session the watcher did not catch —
-    /// a container, or a host whose prompt does not look like one.
+    /// a container, or a host whose prompt does not look like one. If an `ssh`
+    /// command is the one still running, its host names the chip.
     func warpifySession() {
-        installSubshellHooks(named: subshell ?? "shell")
+        let sshHost = runningBlock.flatMap { Self.interactiveSSHHost($0.command) }
+        installSubshellHooks(named: subshell ?? sshHost ?? "shell")
     }
 
     /// `A` arrives from precmd, before the prompt is printed.
