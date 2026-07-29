@@ -75,9 +75,9 @@ enum ShellIntegration {
     static func handshakeSnippet(for flavor: Flavor) -> String {
         switch flavor {
         case .zsh:
-            return #"printf '\e]133;S;zsh\a'"#
+            return #"printf '\033]133;S;zsh\a'"#
         case .bash:
-            return #"printf '\e]133;S;bash\a'"#
+            return #"printf '\033]133;S;bash\a'"#
         }
     }
 
@@ -92,7 +92,7 @@ enum ShellIntegration {
         switch flavor {
         case .zsh:
             return [
-                #"__swiftty_mark() { builtin printf '\e]133;%s\a' "$1"; }"#,
+                #"__swiftty_mark() { builtin printf '\033]133;%s\a' "$1"; }"#,
                 #"__swiftty_hex() { builtin printf '%s' "$1" | command od -An -v -tx1 | command tr -d ' \n'; }"#,
                 #"__swiftty_capture_status() { __swiftty_status=$?; }"#,
                 #"__swiftty_precmd() { if [[ -n "$__swiftty_running" ]]; then __swiftty_mark "D;${__swiftty_status:-0}"; unset __swiftty_running; fi; __swiftty_mark "P;$(__swiftty_hex "$PWD")"; __swiftty_ls "$PWD"; __swiftty_mark "A"; }"#,
@@ -106,12 +106,26 @@ enum ShellIntegration {
 
         case .bash:
             return [
-                #"__swiftty_mark() { printf '\e]133;%s\a' "$1"; }"#,
+                #"__swiftty_mark() { printf '\033]133;%s\a' "$1"; }"#,
                 #"__swiftty_hex() { printf '%s' "$1" | od -An -v -tx1 | tr -d ' \n'; }"#,
-                #"__swiftty_preexec() { [ -n "$COMP_LINE" ] && return 0; [ -n "$__swiftty_running" ] && return 0; case "$BASH_COMMAND" in __swiftty_*|*__swiftty_precmd*) return 0 ;; esac; __swiftty_running=1; __swiftty_mark "P;$(__swiftty_hex "$PWD")"; __swiftty_mark "E;$(__swiftty_hex "$BASH_COMMAND")"; __swiftty_mark "C"; return 0; }"#,
+                // The DEBUG trap fires for every *top-level* simple command, so
+                // guarding on our own helpers (the ls we type to fetch a listing)
+                // and on a command already in flight is enough to mark one C per
+                // real command. A host's own PROMPT_COMMAND — RHEL's `history -a`
+                // — is kept out of the trap another way: see the wrap below.
+                #"__swiftty_preexec() { [ -n "$COMP_LINE" ] && return 0; case "$BASH_COMMAND" in __swiftty_*) return 0 ;; esac; [ -n "$__swiftty_running" ] && return 0; __swiftty_running=1; __swiftty_mark "P;$(__swiftty_hex "$PWD")"; __swiftty_mark "E;$(__swiftty_hex "$BASH_COMMAND")"; __swiftty_mark "C"; return 0; }"#,
                 #"__swiftty_precmd() { local s=$?; if [ -n "$__swiftty_running" ]; then __swiftty_mark "D;$s"; unset __swiftty_running; fi; __swiftty_mark "P;$(__swiftty_hex "$PWD")"; __swiftty_ls "$PWD"; __swiftty_mark "A"; }"#,
                 #"__swiftty_ls() { __swiftty_mark "L;$(__swiftty_hex "$1")|$(__swiftty_hex "$(command ls -1Ap -- "$1" 2>/dev/null | head -400)")"; }"#,
-                #"PROMPT_COMMAND="__swiftty_precmd${PROMPT_COMMAND:+; $PROMPT_COMMAND}""#,
+                // Run the host's existing PROMPT_COMMAND from *inside* a function:
+                // commands invoked from a function do not fire the DEBUG trap, so
+                // `history -a` and friends are never seen as user commands — and
+                // `eval` swallows a trailing `;` (RHEL ships `history -a; `) that
+                // plain concatenation would turn into a `;;` syntax error that
+                // silently broke the whole prompt. The guard makes re-swiftifying
+                // idempotent rather than wrapping the wrapper into a loop.
+                #"[ "$PROMPT_COMMAND" = "__swiftty_prompt_wrap" ] || __swiftty_orig_pc="$PROMPT_COMMAND""#,
+                #"__swiftty_prompt_wrap() { __swiftty_precmd; eval "$__swiftty_orig_pc"; }"#,
+                #"PROMPT_COMMAND=__swiftty_prompt_wrap"#,
                 #"trap '__swiftty_preexec' DEBUG"#,
             ].joined(separator: "; ")
         }
@@ -193,7 +207,7 @@ enum ShellIntegration {
     if [[ -z "$SWIFTTY_BLOCKS_LOADED" ]]; then
       SWIFTTY_BLOCKS_LOADED=1
 
-      __swiftty_mark() { builtin printf '\\e]133;%s\\a' "$1" }
+      __swiftty_mark() { builtin printf '\\033]133;%s\\a' "$1" }
 
       __swiftty_hex() {
         builtin printf '%s' "$1" | command od -An -v -tx1 | command tr -d ' \\n'
@@ -271,20 +285,20 @@ enum ShellIntegration {
     if [ -z "$SWIFTTY_BLOCKS_LOADED" ]; then
       SWIFTTY_BLOCKS_LOADED=1
 
-      __swiftty_mark() { printf '\\e]133;%s\\a' "$1"; }
+      __swiftty_mark() { printf '\\033]133;%s\\a' "$1"; }
 
       __swiftty_hex() { printf '%s' "$1" | od -An -v -tx1 | tr -d ' \\n'; }
 
-      # The DEBUG trap fires before every simple command, not just the ones the
-      # user typed — it also sees each part of PROMPT_COMMAND and anything a
-      # completion function runs. These guards narrow it to one C marker per
-      # real command.
+      # The DEBUG trap fires before every top-level simple command. Guarding on
+      # our own helpers and on a command already in flight narrows it to one C
+      # per real command; a host's own PROMPT_COMMAND is kept out of the trap by
+      # the wrap below rather than by inspecting each command.
       __swiftty_preexec() {
         [ -n "$COMP_LINE" ] && return 0
+        # Never let our own housekeeping (the ls we type to fetch a listing) be
+        # captured as a command.
+        case "$BASH_COMMAND" in __swiftty_*) return 0 ;; esac
         [ -n "$__swiftty_running" ] && return 0
-        case "$BASH_COMMAND" in
-          __swiftty_*|*__swiftty_precmd*) return 0 ;;
-        esac
         __swiftty_running=1
         __swiftty_mark "P;$(__swiftty_hex "$PWD")"
         __swiftty_mark "E;$(__swiftty_hex "$BASH_COMMAND")"
@@ -302,9 +316,15 @@ enum ShellIntegration {
         __swiftty_mark "A"
       }
 
-      # Order matters: install the trap last, or it fires on the assignment
-      # below and reports PROMPT_COMMAND itself as the first command.
-      PROMPT_COMMAND="__swiftty_precmd${PROMPT_COMMAND:+; $PROMPT_COMMAND}"
+      # Run any pre-existing PROMPT_COMMAND from inside a function: commands
+      # invoked from a function do not fire the DEBUG trap, so a host's
+      # PROMPT_COMMAND (RHEL ships `history -a; `) is never mistaken for a user
+      # command. `eval` also tolerates the trailing `;` that plain concatenation
+      # would turn into a `;;` syntax error. The guard keeps re-sourcing from
+      # wrapping the wrapper into an endless loop.
+      [ "$PROMPT_COMMAND" = "__swiftty_prompt_wrap" ] || __swiftty_orig_pc="$PROMPT_COMMAND"
+      __swiftty_prompt_wrap() { __swiftty_precmd; eval "$__swiftty_orig_pc"; }
+      PROMPT_COMMAND=__swiftty_prompt_wrap
       trap '__swiftty_preexec' DEBUG
     fi
     """
