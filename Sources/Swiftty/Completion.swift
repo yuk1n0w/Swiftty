@@ -12,9 +12,12 @@ enum Completion {
         let text: String
         /// Where the caret ends up, at the end of what was inserted.
         let caret: Int
-        /// Every candidate, when the token was ambiguous and only partly
-        /// extended. Empty when the completion was unique.
-        let candidates: [String]
+        /// Index where the token being completed begins, so the caller can
+        /// replace it in place while cycling through candidates on repeated Tab.
+        let tokenStart: Int
+        /// The escaped, ready-to-insert candidates, in order, for Tab-cycling.
+        /// Empty when the completion was unique (nothing to cycle through).
+        let insertions: [String]
     }
 
     /// Directory contents, however they are obtained.
@@ -33,9 +36,20 @@ enum Completion {
         let characters = Array(text)
         let caret = min(max(caret, 0), characters.count)
 
+        // Walk back to the start of the token — but a backslash-escaped space
+        // (`My\ Folder`) is part of the token, not a boundary, so a name with
+        // spaces completes as one word.
         var start = caret
-        while start > 0, !isSeparator(characters[start - 1]) { start -= 1 }
-        let token = String(characters[start..<caret])
+        while start > 0 {
+            if isSeparator(characters[start - 1]), !isEscaped(characters, at: start - 1) {
+                break
+            }
+            start -= 1
+        }
+        // The literal token as typed (may carry backslashes); matching is done
+        // against the unescaped form, which is the real filename prefix.
+        let rawToken = String(characters[start..<caret])
+        let token = unescape(rawToken)
 
         let matches = isCommandPosition(characters, before: start)
             ? executables(matching: token, in: directory, lister: lister)
@@ -46,22 +60,67 @@ enum Completion {
         // caret there — the same thing a shell does on the first Tab.
         let expansion = matches.count == 1 ? matches[0] : commonPrefix(of: matches)
         guard expansion.count >= token.count else { return nil }
-        // A unique directory gets a trailing slash so the next Tab descends.
+        // Escape the expansion so a name with spaces (or other shell
+        // metacharacters) reaches the shell as a single argument. A unique
+        // directory keeps its trailing slash so the next Tab descends; a unique
+        // file gets a plain trailing space that marks the end of the argument
+        // and so must *not* be escaped.
+        let escaped = escape(expansion)
         let insertion = matches.count == 1 && !expansion.hasSuffix("/")
-            ? expansion + " "
-            : expansion
-        guard insertion != token else { return nil }
+            ? escaped + " "
+            : escaped
+        guard insertion != rawToken else { return nil }
 
         let replaced = String(characters[0..<start]) + insertion + String(characters[caret...])
         return Result(
             text: replaced,
             caret: start + insertion.count,
-            candidates: matches.count == 1 ? [] : matches
+            tokenStart: start,
+            // Escaped, and *without* the trailing space a unique file gets — the
+            // caret stays on the name so the next Tab can replace it with the
+            // following candidate.
+            insertions: matches.count > 1 ? matches.map(escape) : []
         )
     }
 
     private static func isSeparator(_ character: Character) -> Bool {
         character == " " || character == "\t" || character == "\n"
+    }
+
+    /// Whether the character at `index` is preceded by an odd run of backslashes,
+    /// i.e. it is escaped.
+    private static func isEscaped(_ characters: [Character], at index: Int) -> Bool {
+        var count = 0
+        var i = index - 1
+        while i >= 0, characters[i] == "\\" { count += 1; i -= 1 }
+        return count % 2 == 1
+    }
+
+    /// Drops the backslashes a user (or a previous completion) put in front of
+    /// shell metacharacters, recovering the real filename prefix to match on.
+    private static func unescape(_ token: String) -> String {
+        var out = ""
+        var escaped = false
+        for ch in token {
+            if escaped { out.append(ch); escaped = false }
+            else if ch == "\\" { escaped = true }
+            else { out.append(ch) }
+        }
+        if escaped { out.append("\\") }
+        return out
+    }
+
+    /// Backslash-escapes the shell metacharacters in a completed path, leaving
+    /// the structural `/` and a leading `~` alone so paths and tilde expansion
+    /// still work.
+    private static func escape(_ path: String) -> String {
+        let special = Set(" \t\"'\\$`&|;<>()*?[]{}")
+        var out = ""
+        for ch in path {
+            if special.contains(ch) { out.append("\\") }
+            out.append(ch)
+        }
+        return out
     }
 
     /// True when the token being completed is a program name rather than an
@@ -183,6 +242,13 @@ enum Completion {
         ])
         return names
     }()
+
+    /// Whether `token` names something runnable — a program on PATH or a shell
+    /// builtin. Natural-language detection uses this so a real command in the
+    /// first position (`make`, `find`, `git`) is never mistaken for prose.
+    static func isKnownCommand(_ token: String) -> Bool {
+        commandNames.contains(token)
+    }
 
     private static func commonPrefix(of candidates: [String]) -> String {
         guard var prefix = candidates.first else { return "" }

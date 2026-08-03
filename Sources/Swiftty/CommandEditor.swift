@@ -27,8 +27,9 @@ struct CommandEditor: NSViewRepresentable {
     /// keeps yanking focus back from the terminal the instant a command hands it
     /// over — so a TUI wouldn't accept input until you switched tabs and back.
     var canClaimFocus: Bool
-    /// Expands the token under the caret; returns the new text and caret.
-    var onComplete: (String, Int) -> (String, Int)?
+    /// Expands the token under the caret; returns the new text and caret plus the
+    /// candidates to cycle through on repeated Tab.
+    var onComplete: (String, Int) -> Completion.Result?
     var onHeightChange: (CGFloat) -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
@@ -142,13 +143,64 @@ struct CommandEditor: NSViewRepresentable {
             parent.onEscape()
         }
 
+        // Tab-cycling state: the candidates to step through, where the token
+        // starts, and the text/caret we last produced — so a repeated Tab with
+        // nothing typed or moved since advances to the next candidate instead of
+        // re-completing from scratch.
+        private var cycleInsertions: [String] = []
+        private var cycleTokenStart = 0
+        private var cycleIndex = -1
+        private var cycleText: String?
+        private var cycleCaret = 0
+
         func commandTextViewDidRequestCompletion(_ view: CommandTextView) {
             let caret = view.selectedRange().location
-            guard let (text, newCaret) = parent.onComplete(view.string, caret) else { return }
+
+            // Continue a cycle: same text and caret as we left it, so this is a
+            // bare Tab. Step to the next candidate, wrapping.
+            if !cycleInsertions.isEmpty, view.string == cycleText, caret == cycleCaret {
+                cycleIndex = (cycleIndex + 1) % cycleInsertions.count
+                let insertion = cycleInsertions[cycleIndex]
+                let ns = view.string as NSString
+                let range = NSRange(location: cycleTokenStart, length: max(0, cycleCaret - cycleTokenStart))
+                let replaced = ns.replacingCharacters(in: range, with: insertion)
+                apply(replaced, caret: cycleTokenStart + (insertion as NSString).length, to: view)
+                return
+            }
+
+            guard let result = parent.onComplete(view.string, caret) else {
+                clearCycle()
+                return
+            }
+            apply(result.text, caret: min(result.caret, (result.text as NSString).length), to: view)
+
+            // More than one candidate: arm the cycle. The Tab just extended to the
+            // common prefix (or left the token unchanged); the next Tab starts
+            // stepping through the candidates from the top.
+            if result.insertions.count > 1 {
+                cycleInsertions = result.insertions
+                cycleTokenStart = result.tokenStart
+                cycleIndex = -1
+                cycleText = view.string
+                cycleCaret = view.selectedRange().location
+            } else {
+                clearCycle()
+            }
+        }
+
+        private func apply(_ text: String, caret: Int, to view: CommandTextView) {
             view.string = text
             view.applyHighlighting()
-            view.setSelectedRange(NSRange(location: min(newCaret, (text as NSString).length), length: 0))
+            view.setSelectedRange(NSRange(location: caret, length: 0))
             parent.text = text
+            cycleText = text
+            cycleCaret = caret
+        }
+
+        private func clearCycle() {
+            cycleInsertions = []
+            cycleIndex = -1
+            cycleText = nil
         }
     }
 }
@@ -229,6 +281,10 @@ final class CommandTextView: NSTextView {
                 commandDelegate?.commandTextView(self, didRequestHistory: 1)
                 return
             }
+
+        case 51 where command:  // Cmd-Delete: clear from the caret to the line start
+            deleteToBeginningOfLine(nil)
+            return
 
         case 53:  // Escape
             commandDelegate?.commandTextViewDidEscape(self)
@@ -422,11 +478,24 @@ enum CommandSyntax {
             if word.hasPrefix("-") {
                 tokens.append(Token(range: range, kind: .flag))
             } else if expectingCommand {
-                tokens.append(Token(range: range, kind: .command))
+                // Only a real program name earns the command color. A half-typed
+                // word or a natural-language request is left in the default text
+                // color rather than painted blue as if it were a command.
+                if looksRunnable(word) {
+                    tokens.append(Token(range: range, kind: .command))
+                }
                 expectingCommand = false
             }
         }
 
         return tokens
+    }
+
+    /// Whether the first word of a command should be tinted as a program name:
+    /// something actually on PATH (or a shell builtin), or an explicit path to a
+    /// program. Everything else stays the default text color.
+    private static func looksRunnable(_ word: String) -> Bool {
+        if word.contains("/") || word.hasPrefix("~") { return true }
+        return Completion.isKnownCommand(word)
     }
 }

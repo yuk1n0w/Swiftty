@@ -282,15 +282,29 @@ final class BlockTracker: ObservableObject {
     /// quiet prompt — where the shell's own line editor is raw — reads as not
     /// interactive.
     func updateInteractive() {
-        // Raw mode is the tell for a local TUI — but not inside an SSH session or
-        // container, where the ssh/exec client holds the *local* tty raw for the
-        // whole session no matter what the far end is doing. There, raw mode is
-        // always on, so it would flag every remote `ls` as a full-screen takeover
-        // and yank the composer (and the keyboard) away on every command. Once a
-        // subshell is swiftified, only the alternate screen marks a remote TUI.
-        let rawIsMeaningful = subshell == nil
-        let interactive = runningBlock != nil
-            && (isAlternateScreen || (rawIsMeaningful && terminalIsRaw()))
+        // What counts as "interactive" (terminal takes the keyboard, composer
+        // steps aside) while a command runs:
+        //   • locally, raw mode or the alternate screen — the reliable tell for a
+        //     TUI (vim, htop, and programs like anipy-cli that read keys raw
+        //     without switching to the alternate screen);
+        //   • inside a swiftified subshell (SSH, a container) *any* running
+        //     command, because the ssh/exec client holds the local tty raw for
+        //     the whole session, so raw mode can no longer tell a remote batch
+        //     command from a remote TUI. Handing the terminal the keyboard is the
+        //     safe default there: an interactive remote program then gets its
+        //     input (otherwise the composer swallows it), while a plain remote
+        //     `ls` simply finishes with the terminal focused. The batch composer
+        //     stays a local-only nicety.
+        let interactive: Bool
+        if runningBlock == nil {
+            interactive = false
+        } else if isAlternateScreen {
+            interactive = true
+        } else if subshell != nil {
+            interactive = true
+        } else {
+            interactive = terminalIsRaw()
+        }
         if interactive != isInteractive { isInteractive = interactive }
         if interactive {
             sawInteractive = true
@@ -692,6 +706,12 @@ final class BlockTracker: ObservableObject {
                 try? await Task.sleep(for: .milliseconds(300))
                 guard !Task.isCancelled, let self, self.subshell == nil else { return }
 
+                // A full-screen program owns the alternate screen (mosh, or a TUI
+                // launched right after ssh); typing hooks into it would only
+                // litter its display and achieve nothing, since it does not
+                // forward our markers. Leave it be.
+                if self.isAlternateScreen { return }
+
                 let line = self.lastVisibleLine()
                 // Two identical samples means output has stopped arriving; the
                 // prompt check keeps the hooks out of a password or yes/no prompt.
@@ -704,10 +724,16 @@ final class BlockTracker: ObservableObject {
         }
     }
 
-    /// The host `ssh host` opens an interactive session to, or nil. Nil for
-    /// `ssh host -- some command`, which runs and exits without ever presenting a
-    /// prompt. A `user@` prefix is dropped so the chip reads as the host — or the
-    /// SSH-config alias — alone: `ssh yukino@rhel` shows as `rhel`.
+    /// The host `ssh host` opens an interactive session to, or nil. Nil for a
+    /// one-off like `ssh host -- some command`, which runs and exits without ever
+    /// presenting a prompt. A `user@` prefix is dropped so the chip reads as the
+    /// host — or the SSH-config alias — alone: `ssh yukino@rhel` shows as `rhel`.
+    ///
+    /// Only plain ssh, deliberately: mosh (and tmux/screen) re-render the remote
+    /// screen on the alternate buffer rather than forwarding the byte stream, so
+    /// the OSC 133 markers blocks are built on never arrive. Typing the hooks into
+    /// such a session does nothing useful — it just litters the remote line — so
+    /// they are left as a plain full-screen terminal instead.
     static func interactiveSSHHost(_ command: String) -> String? {
         let words = command.split(separator: " ").map(String.init)
         guard let first = words.first, first == "ssh" else { return nil }
@@ -769,7 +795,14 @@ final class BlockTracker: ObservableObject {
     /// Types the hooks into whatever shell is on the other end.
     private func installSubshellHooks(named name: String? = nil) {
         guard let view = terminalView else { return }
-        if subshell == nil { localDirectory = currentDirectory }
+        if subshell == nil {
+            localDirectory = currentDirectory
+            // Entering a remote session is a fresh start: wipe the local blocks
+            // (the `ssh` command and everything before it) so the tab shows only
+            // the remote session, the way opening a new terminal would.
+            blocks.removeAll()
+            selectedBlockID = nil
+        }
         remoteListings.removeAll()
         pendingListings.removeAll()
         subshell = name ?? "ssh"

@@ -98,16 +98,17 @@ struct AIModel: Identifiable, Hashable {
     }
 }
 
-struct AIMessage: Identifiable, Equatable {
-    enum Role: String {
+struct AIMessage: Identifiable, Equatable, Codable {
+    enum Role: String, Codable {
         case user
         case assistant
     }
 
-    let id = UUID()
+    var id = UUID()
     let role: Role
-    /// What the bubble shows.
-    let content: String
+    /// What the bubble shows. Mutable so a streamed reply can grow token by
+    /// token in place.
+    var content: String
     /// What is actually sent to the model, when it must differ from what is
     /// shown — e.g. an "Explain" carries a compact label in `content` but the
     /// full command, exit code and output in `sent`. Nil means send `content`.
@@ -205,6 +206,12 @@ final class AppPreferences: ObservableObject {
     @Published var compactBlocks: Bool {
         didSet { persist("compactBlocks", compactBlocks) }
     }
+    /// Routes plainly-worded input in the composer to the AI agent instead of the
+    /// shell — Warp-style natural-language detection. Conservative by design: a
+    /// real command, or anything prefixed with `!`, still runs as a command.
+    @Published var naturalLanguageDetection: Bool {
+        didSet { persist("naturalLanguageDetection", naturalLanguageDetection) }
+    }
 
     /// True when the window should let the desktop through at all.
     var isTranslucent: Bool { windowOpacity < 0.99 }
@@ -261,6 +268,7 @@ final class AppPreferences: ObservableObject {
         windowOpacity = defaults.object(forKey: "windowOpacity") as? Double ?? 0.75
         windowBlur = defaults.object(forKey: "windowBlur") as? Bool ?? true
         compactBlocks = defaults.object(forKey: "compactBlocks") as? Bool ?? false
+        naturalLanguageDetection = defaults.object(forKey: "naturalLanguageDetection") as? Bool ?? true
         sidebarWidth = defaults.object(forKey: "sidebarWidth") as? Double ?? 260
         shellPath = defaults.string(forKey: "shellPath") ?? ShellInfo.path
         let provider = AIProvider(rawValue: defaults.string(forKey: "aiProvider") ?? "OpenAI") ?? .openAI
@@ -403,15 +411,20 @@ enum AIGateway {
         return models
     }
 
-    static func complete(
+    /// Streams a completion, delivering the reply one chunk at a time through
+    /// `onDelta`, so the panel can grow the answer as it arrives instead of
+    /// waiting for the whole thing. `onDelta` may be called from a background
+    /// executor; the caller marshals to the main actor.
+    static func stream(
         provider: AIProvider,
         model: String,
         apiKey: String,
         baseURL: String,
         agent: String,
         customInstructions: String,
-        messages: [AIMessage]
-    ) async throws -> String {
+        messages: [AIMessage],
+        onDelta: @escaping @Sendable (String) -> Void
+    ) async throws {
         guard !provider.requiresAPIKey || !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw AIGatewayError.missingAPIKey
         }
@@ -420,21 +433,19 @@ enum AIGateway {
         }
 
         if provider == .anthropic {
-            return try await completeAnthropic(
+            try await streamAnthropic(
                 model: model,
                 apiKey: apiKey,
                 baseURL: baseURL,
                 agent: agent,
                 customInstructions: customInstructions,
-                messages: messages
+                messages: messages,
+                onDelta: onDelta
             )
+            return
         }
 
         let endpoint = try endpointURL(baseURL, path: "chat/completions")
-        var request = URLRequest(url: endpoint)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        if !apiKey.isEmpty { request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization") }
         var requestMessages: [[String: String]] = messages.map {
             ["role": $0.role.rawValue, "content": $0.payload]
         }
@@ -442,54 +453,109 @@ enum AIGateway {
         if !systemPrompt.isEmpty {
             requestMessages.insert(["role": "system", "content": systemPrompt], at: 0)
         }
-        request.httpBody = try JSONSerialization.data(withJSONObject: [
-            "model": model,
-            "messages": requestMessages,
-            "temperature": 0.4,
-        ])
 
-        let (data, response) = try await URLSession.shared.data(for: request)
-        try validate(response: response, data: data)
-        guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let choices = root["choices"] as? [[String: Any]],
-              let message = choices.first?["message"] as? [String: Any],
-              let content = message["content"] as? String else {
-            throw AIGatewayError.invalidResponse
+        func send(includeTemperature: Bool) async throws {
+            var request = URLRequest(url: endpoint)
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+            if !apiKey.isEmpty { request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization") }
+            var payload: [String: Any] = [
+                "model": model,
+                "messages": requestMessages,
+                "stream": true,
+            ]
+            // A slightly focused temperature gives steadier answers, but the
+            // gpt-5 and o-series models reject any value but the default — the
+            // caller retries without this key when that happens.
+            if includeTemperature { payload["temperature"] = 0.4 }
+            request.httpBody = try JSONSerialization.data(withJSONObject: payload)
+
+            let (bytes, response) = try await URLSession.shared.bytes(for: request)
+            try await validateStream(response: response, bytes: bytes)
+
+            for try await line in bytes.lines {
+                guard let json = eventData(line) else { continue }
+                if json == "[DONE]" { break }
+                guard let data = json.data(using: .utf8),
+                      let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let choices = root["choices"] as? [[String: Any]],
+                      let delta = choices.first?["delta"] as? [String: Any],
+                      let piece = delta["content"] as? String,
+                      !piece.isEmpty else { continue }
+                onDelta(piece)
+            }
         }
-        return content
+
+        do {
+            try await send(includeTemperature: true)
+        } catch let AIGatewayError.server(message)
+            where message.localizedCaseInsensitiveContains("temperature") {
+            // This model only supports the default temperature; resend without
+            // it rather than surface the failure to the user.
+            try await send(includeTemperature: false)
+        }
     }
 
-    private static func completeAnthropic(
+    private static func streamAnthropic(
         model: String,
         apiKey: String,
         baseURL: String,
         agent: String,
         customInstructions: String,
-        messages: [AIMessage]
-    ) async throws -> String {
+        messages: [AIMessage],
+        onDelta: @escaping @Sendable (String) -> Void
+    ) async throws {
         let endpoint = try endpointURL(baseURL, path: "messages")
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
         request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
         request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
         let systemPrompt = systemPrompt(agent: agent, customInstructions: customInstructions)
         var payload: [String: Any] = [
             "model": model,
-            "max_tokens": 1024,
+            "max_tokens": 2048,
+            "stream": true,
             "messages": messages.map { ["role": $0.role.rawValue, "content": $0.payload] },
         ]
         if !systemPrompt.isEmpty { payload["system"] = systemPrompt }
         request.httpBody = try JSONSerialization.data(withJSONObject: payload)
 
-        let (data, response) = try await URLSession.shared.data(for: request)
-        try validate(response: response, data: data)
-        guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let content = root["content"] as? [[String: Any]],
-              let text = content.first?["text"] as? String else {
-            throw AIGatewayError.invalidResponse
+        let (bytes, response) = try await URLSession.shared.bytes(for: request)
+        try await validateStream(response: response, bytes: bytes)
+
+        for try await line in bytes.lines {
+            guard let json = eventData(line),
+                  let data = json.data(using: .utf8),
+                  let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  (root["type"] as? String) == "content_block_delta",
+                  let delta = root["delta"] as? [String: Any],
+                  let text = delta["text"] as? String,
+                  !text.isEmpty else { continue }
+            onDelta(text)
         }
-        return text
+    }
+
+    /// The JSON payload of a server-sent-event `data:` line, or nil for the
+    /// blank lines and `event:` lines that separate events.
+    private static func eventData(_ line: String) -> String? {
+        guard line.hasPrefix("data:") else { return nil }
+        return String(line.dropFirst(5)).trimmingCharacters(in: .whitespaces)
+    }
+
+    /// A streamed request never gets to `validate`, because the body arrives as
+    /// a byte stream rather than one `Data`. On an error status the body still
+    /// carries the provider's JSON error, so drain it and surface the message.
+    private static func validateStream(response: URLResponse, bytes: URLSession.AsyncBytes) async throws {
+        guard let http = response as? HTTPURLResponse else { throw AIGatewayError.invalidResponse }
+        guard !(200..<300).contains(http.statusCode) else { return }
+        var body = Data()
+        for try await byte in bytes { body.append(byte) }
+        let payload = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any]
+        let message = (payload?["error"] as? [String: Any])?["message"] as? String
+        throw AIGatewayError.server(message ?? "The provider returned an HTTP error.")
     }
 
     private static func endpointURL(_ baseURL: String, path: String) throws -> URL {
@@ -617,8 +683,18 @@ struct SwifttyCommands: Commands {
     }
 }
 
+/// Terminals now outlive their SwiftUI views (see `TerminalRegistry`), so on
+/// quit nothing else would reap them — this kills every remaining shell so none
+/// are orphaned.
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationWillTerminate(_ notification: Notification) {
+        MainActor.assumeIsolated { TerminalRegistry.shared.terminateAll() }
+    }
+}
+
 @main
 struct SwifttyApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var preferences: AppPreferences
     @StateObject private var store: TerminalStore
 
@@ -695,6 +771,29 @@ struct SwifttyApp: App {
                 .keyboardShortcut("[", modifiers: [.command, .option])
                 .disabled((store.activeTab?.panes.count ?? 0) < 2)
 
+                Button("Focus Pane Left") { store.focusPane(.left) }
+                    .keyboardShortcut(.leftArrow, modifiers: [.command, .option])
+                    .disabled((store.activeTab?.panes.count ?? 0) < 2)
+                Button("Focus Pane Right") { store.focusPane(.right) }
+                    .keyboardShortcut(.rightArrow, modifiers: [.command, .option])
+                    .disabled((store.activeTab?.panes.count ?? 0) < 2)
+                Button("Focus Pane Up") { store.focusPane(.up) }
+                    .keyboardShortcut(.upArrow, modifiers: [.command, .option])
+                    .disabled((store.activeTab?.panes.count ?? 0) < 2)
+                Button("Focus Pane Down") { store.focusPane(.down) }
+                    .keyboardShortcut(.downArrow, modifiers: [.command, .option])
+                    .disabled((store.activeTab?.panes.count ?? 0) < 2)
+
+                Button("Move Pane to New Tab") {
+                    if let paneID = store.activePaneID { store.popPaneToTab(paneID) }
+                }
+                .keyboardShortcut("d", modifiers: [.command, .option])
+                .disabled((store.activeTab?.panes.count ?? 0) < 2)
+
+                Button("Balance Panes") { store.balanceActivePaneSplits() }
+                    .keyboardShortcut("=", modifiers: [.command, .option])
+                    .disabled((store.activeTab?.panes.count ?? 0) < 2)
+
                 Button("Select Tab 1") { store.select(index: 0) }
                     .keyboardShortcut("1", modifiers: .command)
                     .disabled(store.tabs.count < 1)
@@ -759,6 +858,11 @@ struct SwifttyApp: App {
                 }
                 .keyboardShortcut("i", modifiers: .command)
 
+                Button("Command Palette") {
+                    store.toggleCommandPalette()
+                }
+                .keyboardShortcut("k", modifiers: .command)
+
                 Divider()
 
                 Button("Toggle File Explorer") {
@@ -779,7 +883,10 @@ struct SwifttyApp: App {
                 Button("Clear Blocks") {
                     store.clearBlocks()
                 }
-                .keyboardShortcut("k", modifiers: .command)
+                // Not plain Cmd-Delete: that is the standard "delete to start of
+                // line" every text field uses, and a menu key-equivalent would
+                // swallow it before the composer or the AI field ever saw it.
+                .keyboardShortcut(.delete, modifiers: [.command, .shift])
 
                 Button("Reset Terminal") {
                     store.resetActiveTerminal()
@@ -827,8 +934,14 @@ final class TerminalStore: ObservableObject {
     @Published var searchFocusRequests = 0
     /// Which match Return has stepped to. Wrapped against the match count.
     @Published var searchMatchIndex = 0
+    /// The ⌘K command palette overlay is only on screen while true.
+    @Published var commandPaletteVisible = false
+    /// Bumped each time the palette opens, to pull focus into its search field.
+    @Published var paletteFocusRequests = 0
     @Published private(set) var aiMessages: [AIMessage] = []
     @Published private(set) var aiSending = false
+    /// The in-flight streaming reply, if any — cancelled by Stop.
+    private var aiStreamTask: Task<Void, Never>?
     /// A command the AI panel wants dropped into the composer for review. The
     /// active tab's `BlockStack` picks it up, fills its input, and clears it.
     @Published var composerInjection: String?
@@ -856,6 +969,12 @@ final class TerminalStore: ObservableObject {
     /// mutations (opening several tabs, a directory walk) writes once.
     private var sessionCancellable: AnyCancellable?
     private static let sessionKey = "session.v2"
+
+    /// Persists the AI conversation a beat after it changes, so it survives a
+    /// relaunch. Debounced for the same reason the layout is.
+    private var aiChatCancellable: AnyCancellable?
+    private static let aiChatKey = "ai.chat.v1"
+    private static let maxStoredAIMessages = 200
 
     let preferences: AppPreferences
 
@@ -895,6 +1014,7 @@ final class TerminalStore: ObservableObject {
             for pane in initialTab.panes { makeTracker(for: pane.id) }
         }
 
+        aiMessages = Self.loadAIChat()
         startPersistingSession()
     }
 
@@ -921,6 +1041,28 @@ final class TerminalStore: ObservableObject {
             // idempotent, so there is no need to skip the initial value.
             .debounce(for: .seconds(0.4), scheduler: RunLoop.main)
             .sink { [weak self] _ in self?.persistSession() }
+
+        aiChatCancellable = $aiMessages
+            .debounce(for: .seconds(0.4), scheduler: RunLoop.main)
+            .sink { [weak self] _ in self?.persistAIChat() }
+    }
+
+    private func persistAIChat() {
+        // Drop an empty assistant bubble left behind if the app quit before the
+        // first token streamed in — restoring it would show a reply that never
+        // finishes. Then keep only the tail so a long conversation cannot grow
+        // the stored blob without bound.
+        let cleaned = aiMessages.filter { !($0.role == .assistant && $0.content.isEmpty) }
+        let recent = Array(cleaned.suffix(Self.maxStoredAIMessages))
+        guard let data = try? JSONEncoder().encode(recent) else { return }
+        UserDefaults.standard.set(data, forKey: Self.aiChatKey)
+    }
+
+    private static func loadAIChat() -> [AIMessage] {
+        guard let data = UserDefaults.standard.data(forKey: aiChatKey),
+              let messages = try? JSONDecoder().decode([AIMessage].self, from: data)
+        else { return [] }
+        return messages
     }
 
     private func persistSession() {
@@ -1110,6 +1252,7 @@ final class TerminalStore: ObservableObject {
             close(groups[loc.group].tabs[loc.tab].id)
             return
         }
+        TerminalRegistry.shared.terminate(paneID)
         blockTrackers.removeValue(forKey: paneID)
         ShellIntegration.cleanUp(tabID: paneID)
         var tab = groups[loc.group].tabs[loc.tab]
@@ -1152,6 +1295,72 @@ final class TerminalStore: ObservableObject {
             newTabs.first { $0.activePaneID == tab.activePaneID }?.id ?? newTabs[0].id
     }
 
+    /// Detaches one pane into its own new tab, right after the tab it came from,
+    /// keeping its shell alive — the pane keeps its id (and tracker), so the flat
+    /// pane mount just re-homes its terminal rather than rebuilding it.
+    func popPaneToTab(_ paneID: Pane.ID) {
+        guard let loc = paneLocation(paneID) else { return }
+        // A pane that is already alone is already its own tab.
+        guard groups[loc.group].tabs[loc.tab].panes.count > 1,
+              let pane = groups[loc.group].tabs[loc.tab].panes.first(where: { $0.id == paneID })
+        else { return }
+
+        var source = groups[loc.group].tabs[loc.tab]
+        let collapsed = source.layout.removing(paneID) ?? source.layout
+        source.panes.removeAll { $0.id == paneID }
+        source.layout = collapsed
+        if source.activePaneID == paneID {
+            source.activePaneID = collapsed.paneIDs.first ?? source.panes[0].id
+        }
+        groups[loc.group].tabs[loc.tab] = source
+
+        let newTab = TerminalTab(pane: pane)
+        groups[loc.group].tabs.insert(newTab, at: loc.tab + 1)
+        groups[loc.group].activeTabID = newTab.id
+    }
+
+    /// Resets every split in the active tab to an even 50/50.
+    func balanceActivePaneSplits() {
+        guard let tab = activeTab, tab.isSplit, let loc = paneLocation(tab.activePaneID) else { return }
+        groups[loc.group].tabs[loc.tab].layout = groups[loc.group].tabs[loc.tab].layout.balanced()
+    }
+
+    enum FocusDirection { case left, right, up, down }
+
+    /// Moves focus to the nearest pane in a direction, by geometry rather than
+    /// tree order, so Cmd-Opt-arrows feel like moving around the visible grid.
+    func focusPane(_ direction: FocusDirection) {
+        guard let tab = activeTab, tab.isSplit else { return }
+        let unit = CGRect(x: 0, y: 0, width: 1, height: 1)
+        let leaves = PaneLayout.compute(tab.layout, in: unit).leaves
+        guard let from = leaves[tab.activePaneID] else { return }
+
+        var best: (id: UUID, score: CGFloat)?
+        for (id, rect) in leaves where id != tab.activePaneID {
+            // Must lie in the requested direction.
+            let ahead: Bool
+            switch direction {
+            case .left:  ahead = rect.midX < from.midX
+            case .right: ahead = rect.midX > from.midX
+            case .up:    ahead = rect.midY < from.midY
+            case .down:  ahead = rect.midY > from.midY
+            }
+            guard ahead else { continue }
+            // Prefer panes that overlap on the perpendicular axis (directly
+            // beside/above), then the nearest by centre distance.
+            let overlaps: Bool
+            switch direction {
+            case .left, .right: overlaps = rect.minY < from.maxY && rect.maxY > from.minY
+            case .up, .down:    overlaps = rect.minX < from.maxX && rect.maxX > from.minX
+            }
+            let dx = rect.midX - from.midX, dy = rect.midY - from.midY
+            let distance = (dx * dx + dy * dy).squareRoot()
+            let score = distance + (overlaps ? 0 : 10)
+            if best == nil || score < best!.score { best = (id, score) }
+        }
+        if let best { focusPane(best.id) }
+    }
+
     /// Nudges a split divider (identified by its path in the tab's layout tree) by
     /// `delta` points along `total`, the dimension it slides within.
     func adjustSplit(in tabID: TerminalTab.ID, path: [Int], delta: CGFloat, total: CGFloat) {
@@ -1185,6 +1394,7 @@ final class TerminalStore: ObservableObject {
     func closeGroup(_ id: TabGroup.ID) {
         guard groups.count > 1, let index = groups.firstIndex(where: { $0.id == id }) else { return }
         for pane in groups[index].tabs.flatMap(\.panes) {
+            TerminalRegistry.shared.terminate(pane.id)
             blockTrackers.removeValue(forKey: pane.id)
             ShellIntegration.cleanUp(tabID: pane.id)
         }
@@ -1208,6 +1418,33 @@ final class TerminalStore: ObservableObject {
     /// Return in the search field steps to the next match.
     func advanceSearchMatch(by offset: Int = 1) {
         searchMatchIndex += offset
+    }
+
+    /// ⌘K. Toggles the command palette, always opening onto an empty query.
+    func toggleCommandPalette() {
+        if commandPaletteVisible {
+            commandPaletteVisible = false
+        } else {
+            commandPaletteVisible = true
+            paletteFocusRequests += 1
+        }
+    }
+
+    func closeCommandPalette() {
+        commandPaletteVisible = false
+    }
+
+    /// Runs a command chosen from the palette in the active pane, exactly as if
+    /// it had been typed and submitted there.
+    func runFromPalette(_ command: String) {
+        commandPaletteVisible = false
+        activeBlockTracker?.submit(command)
+    }
+
+    /// The active pane's past commands, most recent first — the palette's history
+    /// section. Empty when no pane is focused yet.
+    var paletteHistory: [HistoryEntry] {
+        activeBlockTracker?.commandHistory ?? []
     }
 
     func toggleSidebar() {
@@ -1239,6 +1476,16 @@ final class TerminalStore: ObservableObject {
         activeBlockTracker?.resetTerminal()
     }
 
+    /// Runs `cd` into a directory in the active pane — the file explorer's
+    /// double-click. Single-quoted (with any inner quote escaped) so paths with
+    /// spaces or other metacharacters are one argument. Works over SSH too, since
+    /// the path is the remote path the explorer is showing.
+    func changeActiveDirectory(to path: String) {
+        guard let tracker = activeBlockTracker else { return }
+        let quoted = "'" + path.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        tracker.submit("cd " + quoted)
+    }
+
     /// Moves the block selection in the active tab. `offset` is -1 for the
     /// previous block, +1 for the next.
     func stepBlockSelection(by offset: Int) {
@@ -1265,37 +1512,118 @@ final class TerminalStore: ObservableObject {
     func sendAI(_ prompt: String) async {
         let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        await sendAIMessage(AIMessage(role: .user, content: trimmed))
+        // A free-text question gets a snapshot of the terminal stapled to it so
+        // the model answers for *this* machine and directory. The bubble still
+        // shows only what the user typed; the context rides along in `sent`.
+        let context = terminalContextBlock()
+        let sent = context.isEmpty ? nil : context + "\n\nUser:\n" + trimmed
+        await sendAIMessage(AIMessage(role: .user, content: trimmed, sent: sent))
     }
 
-    /// Sends one already-built user message and appends the reply. Shared by the
-    /// free-text composer and the block actions, which carry a compact label to
-    /// show but a fuller context to send.
+    /// The composer detected a natural-language request: open the agent panel
+    /// and send it there instead of the shell.
+    func sendAIFromComposer(_ prompt: String) {
+        aiPanelVisible = true
+        Task { await sendAI(prompt) }
+    }
+
+    /// Stops an in-flight reply, keeping whatever streamed in so far.
+    func stopAI() {
+        aiStreamTask?.cancel()
+        aiStreamTask = nil
+        aiSending = false
+    }
+
+    /// A compact snapshot of the active session — where it is, whether it is
+    /// remote, and what was run lately — so the agent's answers are grounded in
+    /// the real terminal rather than generic. Empty when there is no session.
+    private func terminalContextBlock() -> String {
+        guard let tracker = activeBlockTracker else { return "" }
+        var lines = ["[Terminal context — background for you; the user did not type this.]"]
+        if let host = tracker.subshell {
+            lines.append("Session: connected to a remote/subshell session named \"\(host)\".")
+        } else {
+            lines.append("Session: local shell on macOS (\(Self.osVersionString)).")
+        }
+        lines.append("Working directory: \(tracker.currentDirectory)")
+        if let branch = tracker.gitBranch, !branch.isEmpty {
+            lines.append("Git branch: \(branch)")
+        }
+        let recent = tracker.commandHistory.prefix(6).map { "- \($0.command)" }
+        if !recent.isEmpty {
+            lines.append("Recent commands (most recent first):")
+            lines.append(contentsOf: recent)
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    private static let osVersionString: String = {
+        let v = ProcessInfo.processInfo.operatingSystemVersion
+        return "macOS \(v.majorVersion).\(v.minorVersion)"
+    }()
+
+    /// Sends one already-built user message and streams the reply in place.
+    /// Shared by the free-text composer and the block actions, which carry a
+    /// compact label to show but a fuller context to send.
     private func sendAIMessage(_ message: AIMessage) async {
         guard !aiSending else { return }
         aiMessages.append(message)
+        let conversation = aiMessages
+        // The empty assistant bubble we grow as chunks arrive.
+        let replyID = UUID()
+        aiMessages.append(AIMessage(id: replyID, role: .assistant, content: ""))
         aiSending = true
-        defer { aiSending = false }
 
-        do {
-            let response = try await AIGateway.complete(
-                provider: preferences.selectedProvider,
-                model: preferences.selectedModel,
-                apiKey: preferences.apiKey,
-                baseURL: preferences.baseURL,
-                agent: preferences.selectedAgent,
-                customInstructions: preferences.customInstructions,
-                messages: aiMessages
-            )
-            aiMessages.append(AIMessage(role: .assistant, content: response))
-        } catch {
-            aiMessages.append(
-                AIMessage(
-                    role: .assistant,
-                    content: "Request failed: \(error.localizedDescription)"
-                )
-            )
+        let provider = preferences.selectedProvider
+        let model = preferences.selectedModel
+        let apiKey = preferences.apiKey
+        let baseURL = preferences.baseURL
+        let agent = preferences.selectedAgent
+        let custom = preferences.customInstructions
+
+        aiStreamTask = Task { [weak self] in
+            var accumulated = ""
+            let channel = AsyncThrowingStream<String, Error> { continuation in
+                let producer = Task.detached {
+                    do {
+                        try await AIGateway.stream(
+                            provider: provider, model: model, apiKey: apiKey,
+                            baseURL: baseURL, agent: agent, customInstructions: custom,
+                            messages: conversation
+                        ) { piece in continuation.yield(piece) }
+                        continuation.finish()
+                    } catch {
+                        continuation.finish(throwing: error)
+                    }
+                }
+                continuation.onTermination = { _ in producer.cancel() }
+            }
+
+            do {
+                for try await piece in channel {
+                    accumulated += piece
+                    self?.updateAIReply(id: replyID, content: accumulated)
+                }
+                if !Task.isCancelled, accumulated.isEmpty {
+                    self?.updateAIReply(id: replyID, content: "_(no response)_")
+                }
+            } catch {
+                if accumulated.isEmpty {
+                    self?.updateAIReply(id: replyID, content: "Request failed: \(error.localizedDescription)")
+                }
+            }
+            // A deliberate Stop already reset these (and may have started a new
+            // reply); only the natural end of a stream cleans up after itself.
+            if !Task.isCancelled {
+                self?.aiSending = false
+                self?.aiStreamTask = nil
+            }
         }
+    }
+
+    private func updateAIReply(id: AIMessage.ID, content: String) {
+        guard let index = aiMessages.firstIndex(where: { $0.id == id }) else { return }
+        aiMessages[index].content = content
     }
 
     // MARK: - AI on blocks
@@ -1382,6 +1710,7 @@ final class TerminalStore: ObservableObject {
 
         let removed = groups[groupIndex].tabs.remove(at: tabIndex)
         for pane in removed.panes {
+            TerminalRegistry.shared.terminate(pane.id)
             blockTrackers.removeValue(forKey: pane.id)
             ShellIntegration.cleanUp(tabID: pane.id)
         }
@@ -1636,6 +1965,16 @@ indirect enum PaneNode: Equatable, Codable {
                       second: path[0] == 1 ? b.settingFraction(value, at: tail) : b,
                       fraction: f)
     }
+
+    /// A copy with every split reset to an even 50/50.
+    func balanced() -> PaneNode {
+        switch self {
+        case .leaf:
+            return self
+        case .split(let ax, let a, let b, _):
+            return .split(axis: ax, first: a.balanced(), second: b.balanced(), fraction: 0.5)
+        }
+    }
 }
 
 struct TerminalTab: Identifiable, Equatable {
@@ -1729,7 +2068,14 @@ struct TerminalWorkspace: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .animation(.easeOut(duration: 0.24), value: store.sidebarVisible)
             }
+
+            if store.commandPaletteVisible {
+                CommandPaletteOverlay()
+                    .transition(.opacity)
+                    .zIndex(10)
+            }
         }
+        .animation(.easeOut(duration: 0.12), value: store.commandPaletteVisible)
         .preferredColorScheme(preferredColorScheme)
     }
 
@@ -1744,7 +2090,6 @@ struct TerminalWorkspace: View {
 
 struct WorkspaceChrome: View {
     @EnvironmentObject private var store: TerminalStore
-    @State private var commandPalettePresented = false
 
     var body: some View {
         Group {
@@ -1754,15 +2099,8 @@ struct WorkspaceChrome: View {
                         store.toggleSidebar()
                     }
 
-                    ChromeButton(systemName: "command", help: "Command palette") {
-                        commandPalettePresented.toggle()
-                    }
-                    .popover(isPresented: $commandPalettePresented, arrowEdge: .top) {
-                        CommandPaletteView {
-                            commandPalettePresented = false
-                        }
-                        .environmentObject(store)
-                        .frame(width: 290)
+                    ChromeButton(systemName: "command", help: "Command palette (⌘K)") {
+                        store.toggleCommandPalette()
                     }
                 }
                 .padding(.horizontal, 5)
@@ -1973,7 +2311,7 @@ struct TerminalTabStrip: View {
         }
         .frame(maxWidth: 420, alignment: .leading)
         .animation(.spring(response: 0.32, dampingFraction: 0.78), value: store.tabs.count)
-        .animation(.easeOut(duration: 0.18), value: store.activeTabID)
+        .animation(.easeOut(duration: 0.1), value: store.activeTabID)
     }
 }
 
@@ -2115,6 +2453,9 @@ struct WorkspaceMain: View {
                 PaneMountLayer(store: store, full: CGRect(origin: .zero, size: proxy.size))
             }
             .padding(.top, 6)
+            // Breathing room between the terminal and the agent panel, only when
+            // the panel is up — full width otherwise.
+            .padding(.trailing, store.aiPanelVisible ? 14 : 0)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
 
             if store.aiPanelVisible {
@@ -2191,7 +2532,10 @@ struct PaneMountLayer: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .animation(.easeInOut(duration: 0.22), value: store.activeTabID)
+        // A quick crossfade, not a slow dissolve — switching tabs with ⌘1-9 or
+        // Ctrl-Tab should feel instant. easeOut starts at full speed so the new
+        // tab is legible almost immediately.
+        .animation(.easeOut(duration: 0.1), value: store.activeTabID)
     }
 
     private func computeMounts() -> (panes: [PaneMount], dividers: [DividerMount]) {
@@ -2337,10 +2681,16 @@ struct PaneHost: View {
     let isTabVisible: Bool
     @ObservedObject var tracker: BlockTracker
 
+    @State private var hovered = false
+    @State private var dragging = false
+    @State private var dragDistance: CGFloat = 0
+
     private var isActivePane: Bool { tab.activePaneID == pane.id }
     /// The terminal is "active" (and may take the keyboard) only when its tab is
     /// on screen and it is the focused pane.
     private var isLive: Bool { isTabVisible && isActivePane }
+    private let detachThreshold: CGFloat = 44
+    private var readyToDetach: Bool { dragging && dragDistance > detachThreshold }
 
     var body: some View {
         BlockStack(
@@ -2376,6 +2726,18 @@ struct PaneHost: View {
                     .onTapGesture { store.focusPane(pane.id) }
             }
         }
+        // The grabber: drag it out to pop this pane into its own tab.
+        .overlay(alignment: .top) {
+            if isTabVisible && tab.isSplit {
+                paneGrip
+            }
+        }
+        // Feedback once the drag has passed the threshold to detach.
+        .overlay {
+            if readyToDetach {
+                detachHint
+            }
+        }
         // Only splits get a focus ring — a lone pane needs no "which one" cue.
         .overlay {
             if isTabVisible && tab.isSplit {
@@ -2387,6 +2749,113 @@ struct PaneHost: View {
                     .allowsHitTesting(false)
                     .animation(.easeOut(duration: 0.15), value: isActivePane)
             }
+        }
+        .onHover { hovered = $0 }
+    }
+
+    /// A small grabber at the top of the pane. Dragging it far enough tears the
+    /// pane off into its own tab, keeping the shell alive.
+    ///
+    /// The drag is handled by an AppKit view rather than a SwiftUI `DragGesture`:
+    /// a plain SwiftUI view reports `mouseDownCanMoveWindow = true`, so AppKit
+    /// would start moving the whole window on the first drag before the gesture
+    /// ever recognised — which is exactly the "the window moves instead" bug.
+    private var paneGrip: some View {
+        Capsule()
+            .fill(Color.white.opacity(0.4))
+            .frame(width: 28, height: 4)
+            .padding(.vertical, 6)
+            .padding(.horizontal, 16)
+            .background(Color.black.opacity(0.28), in: Capsule())
+            .overlay(Capsule().strokeBorder(Color.white.opacity(0.12)))
+            .overlay {
+                PaneDetachHandle(
+                    onBegin: { store.focusPane(pane.id); dragging = true; dragDistance = 0 },
+                    onChange: { dragDistance = $0 },
+                    onEnd: { distance in
+                        dragging = false
+                        dragDistance = 0
+                        if distance > detachThreshold { store.popPaneToTab(pane.id) }
+                    }
+                )
+            }
+            .padding(.top, 4)
+            .opacity(hovered || dragging ? 1 : 0)
+            .animation(.easeOut(duration: 0.12), value: hovered)
+            // Only grabbable while visible, so an invisible strip never steals
+            // clicks or a drag-select from the top of the terminal.
+            .allowsHitTesting(hovered || dragging)
+            .help("Drag out to move this pane into its own tab")
+    }
+
+    private var detachHint: some View {
+        Label("Release to move into a new tab", systemImage: "rectangle.badge.plus")
+            .font(.system(size: 12, weight: .medium))
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(.ultraThinMaterial, in: Capsule())
+            .overlay(Capsule().strokeBorder(Color.accentColor.opacity(0.6)))
+            .allowsHitTesting(false)
+            .transition(.opacity.combined(with: .scale(scale: 0.9)))
+    }
+}
+
+/// The mouse handling behind the pane grabber. An AppKit view because it must
+/// report `mouseDownCanMoveWindow = false` — otherwise dragging it moves the
+/// whole window (plain SwiftUI views default that to true) instead of tearing
+/// the pane off. Reports the drag distance so the pane can show the "release to
+/// detach" hint and act on release.
+struct PaneDetachHandle: NSViewRepresentable {
+    let onBegin: () -> Void
+    let onChange: (CGFloat) -> Void
+    let onEnd: (CGFloat) -> Void
+
+    func makeNSView(context: Context) -> HandleView {
+        HandleView(onBegin: onBegin, onChange: onChange, onEnd: onEnd)
+    }
+
+    func updateNSView(_ view: HandleView, context: Context) {
+        view.onBegin = onBegin
+        view.onChange = onChange
+        view.onEnd = onEnd
+    }
+
+    final class HandleView: NSView {
+        var onBegin: () -> Void
+        var onChange: (CGFloat) -> Void
+        var onEnd: (CGFloat) -> Void
+        private var start: NSPoint = .zero
+
+        init(onBegin: @escaping () -> Void, onChange: @escaping (CGFloat) -> Void, onEnd: @escaping (CGFloat) -> Void) {
+            self.onBegin = onBegin
+            self.onChange = onChange
+            self.onEnd = onEnd
+            super.init(frame: .zero)
+        }
+
+        @available(*, unavailable)
+        required init?(coder: NSCoder) { fatalError() }
+
+        // The whole point: keep AppKit from starting a window move here.
+        override var mouseDownCanMoveWindow: Bool { false }
+
+        override func resetCursorRects() {
+            addCursorRect(bounds, cursor: .openHand)
+        }
+
+        override func mouseDown(with event: NSEvent) {
+            start = event.locationInWindow
+            onBegin()
+        }
+
+        override func mouseDragged(with event: NSEvent) {
+            let p = event.locationInWindow
+            onChange(hypot(p.x - start.x, p.y - start.y))
+        }
+
+        override func mouseUp(with event: NSEvent) {
+            let p = event.locationInWindow
+            onEnd(hypot(p.x - start.x, p.y - start.y))
         }
     }
 }
@@ -2500,6 +2969,12 @@ extension WorkspaceSidebar {
             return
         }
 
+        // Go remote *first* — before the listing has even arrived — so the local
+        // watch is stopped and no local rows linger. Otherwise the listing-not-
+        // cached branch below would leave the local directory being watched and
+        // its rows on screen, which is what popped a permission prompt for a
+        // local folder during an SSH session.
+        explorerModel.prepareRemote(host: host)
         if let entries = tracker.remoteEntries(for: directory) {
             explorerModel.showRemote(host: host, path: directory, entries: entries)
         } else {
@@ -2550,6 +3025,7 @@ struct FileExplorerPreview: View {
 }
 
 struct SidebarFileRow: View {
+    @EnvironmentObject private var store: TerminalStore
     let entry: FileExplorerEntry
     let depth: Int
     let isExpanded: Bool
@@ -2586,8 +3062,13 @@ struct SidebarFileRow: View {
         }
         .buttonStyle(.plain)
         .contentShape(Rectangle())
+        // Double-click a folder to cd the terminal into it. A simultaneous
+        // gesture so the single-click expand/select still fires immediately.
+        .simultaneousGesture(TapGesture(count: 2).onEnded {
+            if entry.isDirectory { store.changeActiveDirectory(to: entry.url.path) }
+        })
         .help(entry.isDirectory
-            ? (isExpanded ? "Collapse \(entry.name)" : "Expand \(entry.name)")
+            ? (isExpanded ? "Collapse \(entry.name) · double-click to cd here" : "Expand \(entry.name) · double-click to cd here")
             : entry.name)
         .accessibilityLabel((entry.isDirectory ? "Folder " : "File ") + entry.name)
         .accessibilityValue(entry.isDirectory ? (isExpanded ? "Expanded" : "Collapsed") : "")
@@ -2644,8 +3125,64 @@ final class FileExplorerModel: ObservableObject {
     @Published private(set) var remoteHost: String?
     private var remoteEntries: [String] = []
 
+    /// A kernel file-system watch on the current local directory, so the
+    /// explorer reflects files a command (or anything else) creates, renames or
+    /// deletes — without polling. It fires only when the directory actually
+    /// changes, and bursts are coalesced into one refresh, so it costs nothing at
+    /// idle. Remote sessions do not use it; their listings arrive with each
+    /// prompt from the far end instead.
+    private var directoryWatch: DispatchSourceFileSystemObject?
+    private var pendingRefresh: DispatchWorkItem?
+
     init() {
         refresh()
+        startWatching(rootURL)
+    }
+
+    deinit {
+        // Closes the watched fd. The pending refresh captures `self` weakly, so
+        // it no-ops once we are gone — no need to reach for it here (and it is
+        // not Sendable across the nonisolated deinit anyway).
+        directoryWatch?.cancel()
+    }
+
+    private func startWatching(_ url: URL) {
+        stopWatching()
+        // Never open a local directory while a remote session is showing — that
+        // is the whole point of remote mode, and opening a protected local
+        // folder (Documents, Desktop…) would pop a macOS permission prompt for a
+        // folder we are not even looking at.
+        guard remoteHost == nil else { return }
+        let descriptor = open(url.path, O_EVTONLY)
+        guard descriptor >= 0 else { return }
+        let source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: descriptor,
+            eventMask: [.write, .rename, .delete, .extend],
+            queue: .main
+        )
+        source.setEventHandler { [weak self] in
+            MainActor.assumeIsolated { self?.scheduleRefresh() }
+        }
+        source.setCancelHandler { close(descriptor) }
+        directoryWatch = source
+        source.resume()
+    }
+
+    private func stopWatching() {
+        directoryWatch?.cancel()
+        directoryWatch = nil
+        pendingRefresh?.cancel()
+        pendingRefresh = nil
+    }
+
+    /// Coalesces a burst of changes (unpacking an archive, `git clone`) into a
+    /// single refresh a beat later, so the directory is re-read once rather than
+    /// on every syscall.
+    private func scheduleRefresh() {
+        pendingRefresh?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.refresh() }
+        pendingRefresh = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2, execute: work)
     }
 
     /// Home shows as `~`, everything else by its own folder name.
@@ -2659,7 +3196,23 @@ final class FileExplorerModel: ObservableObject {
     ///
     /// Local disk is the wrong machine once a session is remote — the paths
     /// happen to resolve, which makes the wrong answer look like a right one.
+    /// Switches to remote mode the moment the session is known to be remote —
+    /// before any listing has arrived. Stops the local watch and drops the local
+    /// rows so nothing local is read or shown while we wait for the far end.
+    func prepareRemote(host: String) {
+        stopWatching()
+        guard remoteHost != host else { return }
+        remoteHost = host
+        remoteEntries = []
+        rootEntries = []
+        childrenByPath.removeAll()
+        expandedPaths.removeAll()
+        selectedPath = nil
+    }
+
     func showRemote(host: String, path: String, entries: [String]) {
+        // Nothing local to watch once a session is remote.
+        stopWatching()
         remoteHost = host
         remoteEntries = entries
         rootURL = URL(fileURLWithPath: path)
@@ -2675,6 +3228,7 @@ final class FileExplorerModel: ObservableObject {
         remoteHost = nil
         remoteEntries = []
         refresh()
+        startWatching(rootURL)
     }
 
     private func rebuildRemoteRows() {
@@ -2715,6 +3269,7 @@ final class FileExplorerModel: ObservableObject {
         childrenByPath.removeAll()
         selectedPath = nil
         refresh()
+        startWatching(resolved)
     }
 
     var filteredRootEntries: [FileExplorerEntry] {
@@ -2878,88 +3433,295 @@ final class FileExplorerModel: ObservableObject {
 }
 
 
-struct CommandPaletteView: View {
-    @EnvironmentObject private var store: TerminalStore
-    let onDismiss: () -> Void
+/// One selectable line in the command palette — either an app action or a past
+/// command to re-run. `matchIndices` records which characters the current query
+/// hit, so the row can highlight them.
+struct PaletteItem: Identifiable {
+    enum Kind {
+        case action(icon: String, shortcut: String?, run: () -> Void)
+        case history(command: String)
+    }
+    let id: String
+    let title: String
+    let subtitle: String?
+    let kind: Kind
+    var matchIndices: [Int] = []
+}
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("Command palette")
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 10)
-                .padding(.top, 9)
+/// A subsequence fuzzy matcher. Returns a score (higher is better) and the
+/// matched character positions, or nil when `query` is not a subsequence of
+/// `text`. Contiguous runs and word-boundary hits score higher, so "gc" ranks
+/// "git commit" above "graphics-cache".
+enum PaletteMatch {
+    static func score(_ query: String, _ text: String) -> (score: Int, indices: [Int])? {
+        let q = Array(query.lowercased())
+        guard !q.isEmpty else { return (0, []) }
+        let t = Array(text.lowercased())
 
-            CommandPaletteRow(title: "New tab", shortcut: "⌘T", systemName: "plus") {
-                store.newTab()
-                onDismiss()
-            }
-            CommandPaletteRow(title: "Toggle file explorer", shortcut: "⌘S", systemName: "sidebar.left") {
-                store.toggleSidebar()
-                onDismiss()
-            }
-            CommandPaletteRow(title: "Enable blocks in this session", shortcut: "⇧⌘E", systemName: "link") {
-                onDismiss()
-                store.activeBlockTracker?.warpifySession()
-            }
-            CommandPaletteRow(title: "Find in blocks", shortcut: "⌘F", systemName: "magnifyingglass") {
-                onDismiss()
-                store.beginSearch()
-            }
-            CommandPaletteRow(title: "Clear blocks", shortcut: "⌘K", systemName: "square.stack.3d.up.slash") {
-                store.clearBlocks()
-                onDismiss()
-            }
-            CommandPaletteRow(
-                title: store.aiPanelVisible ? "Close AI agent" : "Open AI agent",
-                shortcut: "⌘I",
-                systemName: "sparkles"
-            ) {
-                store.toggleAIPanel()
-                onDismiss()
-            }
-            CommandPaletteRow(title: "Settings", shortcut: "⌘,", systemName: "gearshape") {
-                onDismiss()
-                SettingsCoordinator.open(tab: .general)
-            }
-            CommandPaletteRow(title: "Configure models", shortcut: nil, systemName: "cpu") {
-                onDismiss()
-                SettingsCoordinator.open(tab: .models)
-            }
+        var qi = 0
+        var indices: [Int] = []
+        var score = 0
+        var lastHit = -2
+        var previous: Character?
+
+        for (ti, ch) in t.enumerated() where qi < q.count {
+            guard ch == q[qi] else { previous = ch; continue }
+            if ti == lastHit + 1 { score += 6 }           // contiguous
+            if ti == 0 { score += 10 }                     // start of string
+            else if let p = previous, !p.isLetter, !p.isNumber { score += 7 }  // word boundary
+            score += 1
+            indices.append(ti)
+            lastHit = ti
+            qi += 1
+            previous = ch
         }
-        .padding(.vertical, 8)
-        .background(Color(nsColor: NSColor(calibratedWhite: 0.13, alpha: 0.98)))
-        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        guard qi == q.count else { return nil }
+        score -= t.count / 24                               // gently prefer shorter targets
+        return (score, indices)
     }
 }
 
-struct CommandPaletteRow: View {
-    let title: String
-    let shortcut: String?
-    let systemName: String
-    let action: () -> Void
+/// The ⌘K command palette: a centred overlay that fuzzy-searches every command
+/// this pane has run (session blocks + shell history) plus the app's own
+/// actions. Return runs the highlighted item; a query that matches nothing is
+/// still runnable as a raw command, so the palette doubles as a launcher.
+struct CommandPaletteOverlay: View {
+    @EnvironmentObject private var store: TerminalStore
+    @State private var query = ""
+    @State private var selection = 0
+    @FocusState private var fieldFocused: Bool
 
     var body: some View {
-        Button(action: action) {
+        ZStack(alignment: .top) {
+            Color.black.opacity(0.28)
+                .ignoresSafeArea()
+                .contentShape(Rectangle())
+                .onTapGesture { store.closeCommandPalette() }
+
+            panel
+                .frame(width: 560)
+                .padding(.top, 82)
+        }
+    }
+
+    private var panel: some View {
+        let items = results
+        return VStack(spacing: 0) {
             HStack(spacing: 9) {
-                Image(systemName: systemName)
-                    .frame(width: 17)
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 13))
                     .foregroundStyle(.secondary)
-                Text(title)
-                    .font(.system(size: 12))
-                Spacer(minLength: 8)
-                if let shortcut {
-                    Text(shortcut)
-                        .font(.system(size: 10, weight: .medium, design: .monospaced))
-                        .foregroundStyle(.tertiary)
+                TextField("Run a command or search history…", text: $query)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 14))
+                    .focused($fieldFocused)
+                    .onSubmit { runSelection(in: items) }
+                    .onExitCommand { store.closeCommandPalette() }
+                    .onKeyPress(.downArrow) { move(1, in: items); return .handled }
+                    .onKeyPress(.upArrow) { move(-1, in: items); return .handled }
+                if !query.isEmpty {
+                    Button { query = "" } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.tertiary)
+                    }
+                    .buttonStyle(.plain)
                 }
             }
-            .padding(.horizontal, 10)
-            .frame(height: 30)
-            .contentShape(Rectangle())
+            .padding(.horizontal, 14)
+            .frame(height: 46)
+
+            Divider().opacity(0.5)
+
+            if items.isEmpty {
+                Text(query.isEmpty ? "No history yet" : "Press ⏎ to run “\(query)”")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 14)
+            } else {
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(spacing: 1) {
+                            ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
+                                PaletteResultRow(item: item, selected: index == selection)
+                                    .id(item.id)
+                                    .contentShape(Rectangle())
+                                    .onTapGesture { invoke(item) }
+                                    .onHover { if $0 { selection = index } }
+                            }
+                        }
+                        .padding(6)
+                    }
+                    .frame(maxHeight: 372)
+                    .onChange(of: selection) { _, new in
+                        if items.indices.contains(new) {
+                            proxy.scrollTo(items[new].id, anchor: .center)
+                        }
+                    }
+                }
+            }
         }
-        .buttonStyle(.plain)
-        .foregroundStyle(.primary)
+        .background(Color(nsColor: NSColor(calibratedWhite: 0.13, alpha: 0.985)))
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(Color.white.opacity(0.08), lineWidth: 1)
+        )
+        .shadow(color: .black.opacity(0.45), radius: 30, y: 14)
+        .onAppear { fieldFocused = true; selection = 0 }
+        .onChange(of: store.paletteFocusRequests) { _, _ in fieldFocused = true }
+        .onChange(of: query) { _, _ in selection = 0 }
+    }
+
+    // MARK: - Result assembly
+
+    private var results: [PaletteItem] {
+        let q = query.trimmingCharacters(in: .whitespaces)
+        let acts = actions()
+        let hist = historyItems()
+        guard !q.isEmpty else { return acts + Array(hist.prefix(8)) }
+
+        func ranked(_ source: [PaletteItem]) -> [PaletteItem] {
+            source.compactMap { item -> (PaletteItem, Int)? in
+                guard let m = PaletteMatch.score(q, item.title) else { return nil }
+                var copy = item
+                copy.matchIndices = m.indices
+                return (copy, m.score)
+            }
+            .sorted { $0.1 > $1.1 }
+            .map(\.0)
+        }
+        return ranked(acts) + Array(ranked(hist).prefix(40))
+    }
+
+    private func actions() -> [PaletteItem] {
+        var items: [PaletteItem] = []
+        func add(_ title: String, _ icon: String, _ shortcut: String?, _ run: @escaping () -> Void) {
+            items.append(PaletteItem(
+                id: "action:" + title,
+                title: title,
+                subtitle: nil,
+                kind: .action(icon: icon, shortcut: shortcut, run: run)
+            ))
+        }
+        add("New Tab", "plus", "⌘T") { store.newTab() }
+        add("Split Right", "rectangle.split.2x1", "⌘D") { store.splitActivePane(.row) }
+        add("Split Down", "rectangle.split.1x2", "⇧⌘D") { store.splitActivePane(.column) }
+        add("Toggle File Explorer", "sidebar.left", "⌘S") { store.toggleSidebar() }
+        add(store.aiPanelVisible ? "Close AI Agent" : "Open AI Agent", "sparkles", "⌘I") { store.toggleAIPanel() }
+        add("Find in Blocks", "text.magnifyingglass", "⌘F") { store.beginSearch() }
+        add("Clear Blocks", "square.stack.3d.up.slash", "⌘⌫") { store.clearBlocks() }
+        add("Reset Terminal", "arrow.counterclockwise", "⇧⌘K") { store.resetActiveTerminal() }
+        add("Enable Blocks in This Session", "link", "⇧⌘E") { store.activeBlockTracker?.warpifySession() }
+        add("Settings", "gearshape", "⌘,") { SettingsCoordinator.open(tab: .general) }
+        add("Configure Models", "cpu", nil) { SettingsCoordinator.open(tab: .models) }
+        return items
+    }
+
+    private func historyItems() -> [PaletteItem] {
+        store.paletteHistory.map { entry in
+            PaletteItem(
+                id: "hist:" + entry.command,
+                title: entry.command,
+                subtitle: entry.relativeLabel,
+                kind: .history(command: entry.command)
+            )
+        }
+    }
+
+    // MARK: - Navigation
+
+    private func move(_ delta: Int, in items: [PaletteItem]) {
+        guard !items.isEmpty else { return }
+        selection = (selection + delta + items.count) % items.count
+    }
+
+    private func runSelection(in items: [PaletteItem]) {
+        if items.indices.contains(selection) {
+            invoke(items[selection])
+        } else if !query.trimmingCharacters(in: .whitespaces).isEmpty {
+            store.runFromPalette(query)
+        }
+    }
+
+    private func invoke(_ item: PaletteItem) {
+        switch item.kind {
+        case .action(_, _, let run):
+            store.closeCommandPalette()
+            run()
+        case .history(let command):
+            store.runFromPalette(command)
+        }
+    }
+}
+
+struct PaletteResultRow: View {
+    let item: PaletteItem
+    let selected: Bool
+
+    private var icon: String {
+        if case .action(let icon, _, _) = item.kind { return icon }
+        return "clock.arrow.circlepath"
+    }
+    private var shortcut: String? {
+        if case .action(_, let shortcut, _) = item.kind { return shortcut }
+        return nil
+    }
+    /// History rows render in monospace (they are shell commands); action titles
+    /// stay in the UI font.
+    private var isCommand: Bool {
+        if case .history = item.kind { return true }
+        return false
+    }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: icon)
+                .font(.system(size: 12))
+                .frame(width: 18)
+                .foregroundStyle(selected ? .primary : .secondary)
+            Text(highlightedTitle)
+                .font(.system(size: 13, design: isCommand ? .monospaced : .default))
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer(minLength: 8)
+            if let subtitle = item.subtitle {
+                Text(subtitle)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+            }
+            if let shortcut {
+                Text(shortcut)
+                    .font(.system(size: 10, weight: .medium, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 2)
+                    .background(Color.white.opacity(0.07))
+                    .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+            }
+        }
+        .padding(.horizontal, 10)
+        .frame(height: 34)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(selected ? Color.accentColor.opacity(0.24) : Color.clear)
+        )
+    }
+
+    private var highlightedTitle: AttributedString {
+        let hits = Set(item.matchIndices)
+        guard !hits.isEmpty else { return AttributedString(item.title) }
+        var result = AttributedString()
+        for (index, character) in item.title.enumerated() {
+            var piece = AttributedString(String(character))
+            if hits.contains(index) {
+                piece.foregroundColor = Color.accentColor
+                piece.inlinePresentationIntent = .stronglyEmphasized
+            }
+            result.append(piece)
+        }
+        return result
     }
 }
 
@@ -2967,6 +3729,7 @@ struct AIAgentPanel: View {
     @EnvironmentObject private var store: TerminalStore
     @EnvironmentObject private var preferences: AppPreferences
     @State private var draft = ""
+    private static let bottomAnchor = "ai.transcript.bottom"
 
     var body: some View {
         VStack(spacing: 0) {
@@ -3051,15 +3814,23 @@ struct AIAgentPanel: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 10) {
-                        ForEach(store.aiMessages) { message in
-                            AIMessageBubble(message: message)
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 10) {
+                            ForEach(store.aiMessages) { message in
+                                AIMessageBubble(message: message)
+                            }
+                            // Anchor to keep the newest text in view as it streams.
+                            Color.clear.frame(height: 1).id(Self.bottomAnchor)
                         }
+                        .padding(12)
                     }
-                    .padding(12)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .onChange(of: store.aiMessages.last?.content) { _, _ in
+                        proxy.scrollTo(Self.bottomAnchor, anchor: .bottom)
+                    }
+                    .onAppear { proxy.scrollTo(Self.bottomAnchor, anchor: .bottom) }
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
 
             VStack(spacing: 7) {
@@ -3075,23 +3846,27 @@ struct AIAgentPanel: View {
 
                 HStack {
                     Circle()
-                        .fill(preferences.isConfigured ? Color.green : Color.orange)
+                        .fill(store.aiSending ? Color.purple : (preferences.isConfigured ? Color.green : Color.orange))
                         .frame(width: 7, height: 7)
-                    Text(preferences.isConfigured ? "Ready" : "Configure a model in Settings")
+                    Text(store.aiSending ? "Thinking…" : (preferences.isConfigured ? "Ready" : "Configure a model in Settings"))
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)
                     Spacer()
-                    Button { sendDraft() } label: {
-                        if store.aiSending {
-                            ProgressView()
-                                .controlSize(.small)
-                        } else {
+                    if store.aiSending {
+                        Button { store.stopAI() } label: {
+                            Image(systemName: "stop.fill")
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .help("Stop generating")
+                    } else {
+                        Button { sendDraft() } label: {
                             Image(systemName: "arrow.up")
                         }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                        .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
-                    .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || store.aiSending)
                 }
             }
             .padding(10)
@@ -3115,16 +3890,21 @@ struct AIMessageBubble: View {
                 .font(.system(size: 10, weight: .semibold))
                 .foregroundStyle(message.role == .user ? .blue : .purple)
 
-            ForEach(Array(segments.enumerated()), id: \.offset) { _, segment in
-                switch segment {
-                case .prose(let text):
-                    Text(text)
-                        .font(.system(size: 12))
-                        .textSelection(.enabled)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                case .code(let code):
-                    AICodeBlock(code: code)
+            if message.role == .assistant && message.content.isEmpty {
+                // The reply's placeholder bubble, before the first token lands.
+                TypingIndicator()
+            } else {
+                ForEach(Array(segments.enumerated()), id: \.offset) { _, segment in
+                    switch segment {
+                    case .prose(let text):
+                        Text(text)
+                            .font(.system(size: 12))
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    case .code(let code):
+                        AICodeBlock(code: code)
+                    }
                 }
             }
         }
@@ -3140,6 +3920,33 @@ struct AIMessageBubble: View {
         message.role == .user
             ? [.prose(message.content)]
             : AIMessageSegment.parse(message.content)
+    }
+}
+
+/// Three dots that breathe while the first token of a reply is still on its way.
+struct TypingIndicator: View {
+    @State private var phase = 0.0
+
+    var body: some View {
+        HStack(spacing: 4) {
+            ForEach(0..<3, id: \.self) { i in
+                Circle()
+                    .fill(Color.secondary)
+                    .frame(width: 5, height: 5)
+                    .opacity(0.35 + 0.45 * pulse(i))
+            }
+        }
+        .frame(height: 12)
+        .onAppear {
+            withAnimation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true)) {
+                phase = 1
+            }
+        }
+    }
+
+    private func pulse(_ index: Int) -> Double {
+        // A small phase offset per dot makes the three ripple rather than blink.
+        abs(sin((phase + Double(index) * 0.25) * .pi))
     }
 }
 
@@ -3321,6 +4128,15 @@ struct GeneralSettingsView: View {
                     .foregroundStyle(.secondary)
             } header: {
                 Text("Blocks")
+            }
+
+            Section {
+                Toggle("Detect natural language in the command bar", isOn: $preferences.naturalLanguageDetection)
+                Text("Plainly-worded input (\u{201C}how do I…\u{201D}) is sent to the AI agent on Return instead of the shell. A real command still runs; prefix with \u{201C}!\u{201D} to force the shell.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            } header: {
+                Text("AI command bar")
             }
 
             Section {
@@ -3627,6 +4443,39 @@ struct SettingsSectionHeader: View {
     }
 }
 
+/// Owns the live terminal views, keyed by pane id, so a terminal outlives the
+/// SwiftUI representable that hosts it.
+///
+/// This is what makes a pane's shell survive being torn off into another window:
+/// SwiftUI rebuilds an `NSViewRepresentable` when it moves between windows, which
+/// would normally respawn the shell. Instead the terminal is cached here, reused
+/// on the far side of a move, and only actually terminated when the pane is
+/// really closed (by the store) or the app quits — never when SwiftUI merely
+/// dismantles the view.
+@MainActor
+final class TerminalRegistry {
+    static let shared = TerminalRegistry()
+    private var views: [Pane.ID: SwifttyTerminalView] = [:]
+
+    func view(for id: Pane.ID) -> SwifttyTerminalView? { views[id] }
+
+    func register(_ view: SwifttyTerminalView, for id: Pane.ID) {
+        views[id] = view
+    }
+
+    /// Kills the pane's shell and forgets its view. Called by the store when a
+    /// pane is genuinely closed.
+    func terminate(_ id: Pane.ID) {
+        views.removeValue(forKey: id)?.terminate()
+    }
+
+    /// Kills every shell — the app is quitting.
+    func terminateAll() {
+        for view in views.values { view.terminate() }
+        views.removeAll()
+    }
+}
+
 struct TerminalSessionView: NSViewRepresentable {
     @EnvironmentObject private var preferences: AppPreferences
     let paneID: Pane.ID
@@ -3657,6 +4506,20 @@ struct TerminalSessionView: NSViewRepresentable {
     }
 
     func makeNSView(context: Context) -> SwifttyTerminalView {
+        // A terminal already exists for this pane — it is being re-hosted (a move
+        // into another window). Reuse it so its shell, scrollback and running
+        // process carry over untouched; only re-point the delegate at this
+        // representable's coordinator. The tracker is the same instance (one
+        // store), and its OSC handler and view reference are still live, so it is
+        // deliberately *not* re-attached (that would double-register the handler).
+        if let existing = TerminalRegistry.shared.view(for: paneID) {
+            existing.removeFromSuperview()
+            existing.processDelegate = context.coordinator
+            context.coordinator.terminal = existing
+            existing.applyBackground(opacity: preferences.windowOpacity)
+            return existing
+        }
+
         let terminal = SwifttyTerminalView(frame: .zero)
         terminal.font = NSFont.monospacedSystemFont(ofSize: preferences.terminalFontSize, weight: .regular)
         terminal.nativeForegroundColor = NSColor(calibratedWhite: 0.92, alpha: 1)
@@ -3708,6 +4571,7 @@ struct TerminalSessionView: NSViewRepresentable {
         )
 
         terminal.setCursorBlink(preferences.terminalCursorBlink)
+        TerminalRegistry.shared.register(terminal, for: paneID)
 
         DispatchQueue.main.async {
             guard isActive, wantsFocus else { return }
@@ -3734,7 +4598,11 @@ struct TerminalSessionView: NSViewRepresentable {
     }
 
     static func dismantleNSView(_ terminal: SwifttyTerminalView, coordinator: Coordinator) {
-        terminal.terminate()
+        // Deliberately does NOT terminate the shell. The terminal outlives this
+        // representable so it can be re-hosted in another window; the registry
+        // owns its lifetime, and the store terminates it on a real close (or the
+        // app terminates them all on quit). Terminating here would kill a shell
+        // every time a pane was merely moved.
     }
 
     final class Coordinator: NSObject, LocalProcessTerminalViewDelegate {

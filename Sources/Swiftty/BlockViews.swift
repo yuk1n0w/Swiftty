@@ -151,6 +151,9 @@ private enum BlockStyle {
     static let chipText = SwiftUI.Color(white: 0.78)
     static let searchRing = SwiftUI.Color(red: 0.98, green: 0.78, blue: 0.35).opacity(0.7)
     static let promptRemote = SwiftUI.Color(red: 0.55, green: 0.85, blue: 0.98)
+    /// The AI accent — a magenta, matching Warp's natural-language cue and the
+    /// agent panel's sparkle.
+    static let agentAccent = SwiftUI.Color(red: 0.83, green: 0.44, blue: 0.94)
 
     static func background(
         _ state: CommandBlock.State,
@@ -216,6 +219,58 @@ private let historyWindowSize = 9
 
 // MARK: - Block surface
 
+/// The pane's focus-return and animation hooks, lifted out of `BlockStack.body`
+/// so its modifier chain stays short enough for the SwiftUI type-checker.
+///
+/// Each hook exists because something took or replaced the keyboard and the
+/// caret belongs back in the command editor — where typing goes, so it should
+/// never be left without focus.
+private struct PaneReactions: ViewModifier {
+    @ObservedObject var store: TerminalStore
+    @ObservedObject var tracker: BlockTracker
+    @Binding var editorFocusRequests: Int
+    @Binding var draft: String
+    let historyOpen: Bool
+
+    private var isActivePane: Bool { store.activeBlockTracker === tracker }
+
+    func body(content: Content) -> some View {
+        content
+            // Closing the find bar, or a command finishing, hands the caret back.
+            .onChange(of: store.searchVisible) { _, visible in
+                if !visible { editorFocusRequests += 1 }
+            }
+            .onChange(of: tracker.runningBlock?.id) { _, running in
+                if running == nil { editorFocusRequests += 1 }
+            }
+            .onChange(of: tracker.isSubmitting) { _, submitting in
+                if !submitting { editorFocusRequests += 1 }
+            }
+            // An AI-suggested command lands in the active tab's composer, ready
+            // to review and run. Only the visible tab claims it, then clears it.
+            .onChange(of: store.composerInjection) { _, injection in
+                guard let injection, store.activeBlockTracker === tracker else { return }
+                draft = injection
+                editorFocusRequests += 1
+                store.composerInjection = nil
+            }
+            // Clicking a pane makes it the active pane; the caret should follow.
+            .onChange(of: isActivePane) { _, active in
+                if active { editorFocusRequests += 1 }
+            }
+            // Entering or leaving a swiftified subshell (SSH, a container) swaps
+            // the whole prompt out from under the composer; pull the caret back so
+            // the first thing you type after an `ssh` lands in the input, not the
+            // void — the cause of the "beep, nothing happens" over SSH.
+            .onChange(of: tracker.subshell) { _, _ in
+                editorFocusRequests += 1
+            }
+            .animation(.easeOut(duration: 0.2), value: store.searchVisible)
+            .animation(.easeOut(duration: 0.2), value: tracker.runningVisible)
+            .animation(.easeOut(duration: 0.18), value: historyOpen)
+    }
+}
+
 /// The main terminal surface: finished commands stacked as blocks, with the
 /// live terminal at the bottom as the block being typed into.
 struct BlockStack<Terminal: View>: View {
@@ -251,81 +306,20 @@ struct BlockStack<Terminal: View>: View {
 
     var body: some View {
         GeometryReader { proxy in
-            // The terminal is deliberately NOT inside the scroll view, and
-            // appears exactly once in exactly one place in this hierarchy.
-            //
-            // It is an NSViewRepresentable owning a live shell: whenever
-            // SwiftUI decides it has a new identity it tears the old view down
-            // and builds another, and every rebuild forks another zsh. A
-            // `LazyVStack` recycles its children as they scroll, and an
-            // `if/else` that renders the terminal in both branches counts as
-            // two different views — either one silently accumulates orphaned
-            // shells, and typing then goes to whichever one is no longer on
-            // screen. Blocks scroll above it; this stays put.
-            VStack(spacing: 0) {
-                if showsBlocks {
-                    blockHistory
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                }
-
-                // Collapsed to nothing while the shell waits at a prompt. The
-                // composer floats over the blocks instead of sitting in a slot
-                // of its own, and a slot with any height would show its own
-                // full-width background as a band beneath the card.
-                liveBlock(viewport: proxy.size.height)
-                    .frame(height: showsBlocks ? slotHeight(viewport: proxy.size.height) : nil)
-
-                // A batch command (brew, a build) keeps the composer at the
-                // bottom, below its output — you can queue the next command
-                // while it runs. An interactive TUI takes the whole view and
-                // the composer floats away (handled in the overlay below).
-                if showsBlocks, batchRunning {
-                    composer
-                        .frame(height: composerHeight)
-                        .transition(.opacity)
-                }
-            }
+            paneStack(viewport: proxy.size.height)
             .overlay(alignment: .top) {
                 if store.searchVisible {
                     findBar
                         .transition(.move(edge: .top).combined(with: .opacity))
                 }
             }
-            // Closing the find bar, or a command finishing, hands the caret
-            // back to the editor — it is where typing goes, so it should never
-            // be left without focus.
-            .onChange(of: store.searchVisible) { _, visible in
-                if !visible { editorFocusRequests += 1 }
-            }
-            .onChange(of: tracker.runningBlock?.id) { _, running in
-                if running == nil { editorFocusRequests += 1 }
-            }
-            .onChange(of: tracker.isSubmitting) { _, submitting in
-                if !submitting { editorFocusRequests += 1 }
-            }
-            // An AI-suggested command lands in the active tab's composer, ready
-            // to review and run. Only the visible tab claims it, then clears it.
-            .onChange(of: store.composerInjection) { _, injection in
-                guard let injection, store.activeBlockTracker === tracker else { return }
-                draft = injection
-                editorFocusRequests += 1
-                store.composerInjection = nil
-            }
-            // Clicking a pane makes it the active pane; the caret should follow,
-            // so its composer grabs the keyboard the moment it becomes active.
-            .onChange(of: isActivePane) { _, active in
-                if active { editorFocusRequests += 1 }
-            }
-            // Entering or leaving a swiftified subshell (SSH, a container) swaps
-            // the whole prompt out from under the composer; pull the caret back so
-            // the first thing you type after an `ssh` lands in the input, not the
-            // void — the cause of the "beep, nothing happens" over SSH.
-            .onChange(of: tracker.subshell) { _, _ in
-                editorFocusRequests += 1
-            }
-            .animation(.easeOut(duration: 0.2), value: store.searchVisible)
-            .animation(.easeOut(duration: 0.2), value: tracker.runningVisible)
-            .animation(.easeOut(duration: 0.18), value: historyOpen)
+            .modifier(PaneReactions(
+                store: store,
+                tracker: tracker,
+                editorFocusRequests: $editorFocusRequests,
+                draft: $draft,
+                historyOpen: historyOpen
+            ))
             .overlay(alignment: .bottom) {
                 // At a prompt the composer floats over the blocks. It stays put
                 // through a quick command instead of fading out and back — it
@@ -336,6 +330,47 @@ struct BlockStack<Terminal: View>: View {
                     composer
                         .transition(.opacity)
                 }
+            }
+        }
+    }
+
+    /// The pane's stacked content: scrollable blocks, the live slot, and a
+    /// batch command's inline composer. Pulled out of `body` so the long
+    /// modifier chain there (focus hooks, animations, overlays) applies to a
+    /// small typed base rather than a big literal the type-checker stalls on.
+    ///
+    /// The terminal is deliberately NOT inside the scroll view, and appears
+    /// exactly once in exactly one place in this hierarchy. It is an
+    /// NSViewRepresentable owning a live shell: whenever SwiftUI decides it has
+    /// a new identity it tears the old view down and builds another, and every
+    /// rebuild forks another zsh. A `LazyVStack` recycles its children as they
+    /// scroll, and an `if/else` that renders the terminal in both branches
+    /// counts as two different views — either one silently accumulates orphaned
+    /// shells, and typing then goes to whichever one is no longer on screen.
+    /// Blocks scroll above it; this stays put.
+    @ViewBuilder
+    private func paneStack(viewport: CGFloat) -> some View {
+        VStack(spacing: 0) {
+            if showsBlocks {
+                blockHistory
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+
+            // Collapsed to nothing while the shell waits at a prompt. The
+            // composer floats over the blocks instead of sitting in a slot
+            // of its own, and a slot with any height would show its own
+            // full-width background as a band beneath the card.
+            liveBlock(viewport: viewport)
+                .frame(height: showsBlocks ? slotHeight(viewport: viewport) : nil)
+
+            // A batch command (brew, a build) keeps the composer at the
+            // bottom, below its output — you can queue the next command
+            // while it runs. An interactive TUI takes the whole view and
+            // the composer floats away (handled in the overlay below).
+            if showsBlocks, batchRunning {
+                composer
+                    .frame(height: composerHeight)
+                    .transition(.opacity)
             }
         }
     }
@@ -562,15 +597,38 @@ struct BlockStack<Terminal: View>: View {
 
                 Spacer(minLength: 8)
 
-                Image(systemName: "return")
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(BlockStyle.hint)
+                if agentDetected {
+                    // Warp's "(autodetected)" cue: Return will ask the AI.
+                    HStack(spacing: 5) {
+                        Image(systemName: "sparkles")
+                        Text("Ask AI")
+                            .font(.system(size: 11, weight: .semibold))
+                        Image(systemName: "return")
+                    }
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(BlockStyle.agentAccent)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(BlockStyle.agentAccent.opacity(0.14))
+                    .clipShape(Capsule())
+                    .transition(.opacity)
+                } else {
+                    Image(systemName: "return")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(BlockStyle.hint)
+                }
             }
 
             HStack(spacing: 16) {
-                hint("return", "send command to shell")
-                hint("command", "new line", secondSymbol: "return")
+                if agentDetected {
+                    hint("sparkles", "ask the AI agent")
+                    hint("exclamationmark", "run as command", secondSymbol: "return")
+                } else {
+                    hint("return", "send command to shell")
+                    hint("command", "new line", secondSymbol: "return")
+                }
             }
+            .animation(.easeOut(duration: 0.12), value: agentDetected)
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 17)
@@ -599,7 +657,7 @@ struct BlockStack<Terminal: View>: View {
     }
 
     /// Expands the token under the caret against PATH and the filesystem.
-    private func completeToken(_ text: String, _ caret: Int) -> (String, Int)? {
+    private func completeToken(_ text: String, _ caret: Int) -> Completion.Result? {
         // Remote sessions resolve paths on the far end. A miss returns nil and
         // fires a request, so a second Tab completes once the answer lands.
         let lister: Completion.Lister? = tracker.subshell == nil ? nil : { path in
@@ -608,13 +666,12 @@ struct BlockStack<Terminal: View>: View {
             return nil
         }
 
-        guard let result = Completion.complete(
+        return Completion.complete(
             text: text,
             caret: caret,
             directory: tracker.workingDirectory,
             lister: lister
-        ) else { return nil }
-        return (result.text, result.caret)
+        )
     }
 
     /// Where the command will run: which shell, which directory, which branch.
@@ -693,7 +750,41 @@ struct BlockStack<Terminal: View>: View {
         historyIndex = -1
         stashedDraft = ""
         draft = ""
+
+        // Warp-style natural-language routing. A leading `!` (before a letter or
+        // space, so bash's `!!`/`!$` history syntax is untouched) forces the
+        // shell; otherwise a plainly-worded line goes to the AI agent. When the
+        // feature is off, everything runs as typed.
+        if preferences.naturalLanguageDetection {
+            if let stripped = Self.forcedShellCommand(command) {
+                tracker.submit(stripped)
+                return
+            }
+            if IntentClassifier.classify(command) == .agent {
+                store.sendAIFromComposer(command)
+                return
+            }
+        }
         tracker.submit(command)
+    }
+
+    /// If `command` starts with a `!` override, returns the command to run with
+    /// the `!` removed; otherwise nil. `!!` and `!$` (bash history expansion)
+    /// are deliberately left alone.
+    private static func forcedShellCommand(_ command: String) -> String? {
+        guard command.hasPrefix("!") else { return nil }
+        let after = command.dropFirst()
+        guard let next = after.first, next == " " || next.isLetter else { return nil }
+        return after.drop(while: { $0 == " " }).isEmpty ? nil : String(after.drop(while: { $0 == " " }))
+    }
+
+    /// Whether Return on the current draft will ask the AI rather than run a
+    /// command — drives the composer's hint and the "Ask AI" pill. A `!` prefix
+    /// (the force-shell override) always reads as a command.
+    private var agentDetected: Bool {
+        preferences.naturalLanguageDetection
+            && !draft.hasPrefix("!")
+            && IntentClassifier.classify(draft) == .agent
     }
 
     /// Walks the history list; `offset` is -1 for older, +1 for newer.
@@ -744,41 +835,47 @@ struct BlockStack<Terminal: View>: View {
         return newest..<(oldest + 1)
     }
 
+    /// The "HISTORY" bar at the top of the palette. Pulled out of
+    /// `historyPalette` so neither expression is large enough to stall the
+    /// type-checker: it carries the find-bar overlay and the focus-return
+    /// hooks (closing the find bar, or a command finishing, hands the caret
+    /// back to the editor, which is where typing goes).
+    private var historyHeader: some View {
+        HStack {
+            Text("HISTORY")
+                .font(.system(size: 10, weight: .semibold))
+                .kerning(0.8)
+                .foregroundStyle(BlockStyle.chipText)
+            Spacer()
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 9)
+        .overlay(alignment: .top) {
+            if store.searchVisible {
+                findBar
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            }
+        }
+        .onChange(of: store.searchVisible) { _, visible in
+            if !visible { editorFocusRequests += 1 }
+        }
+        .onChange(of: tracker.runningBlock?.id) { _, running in
+            if running == nil { editorFocusRequests += 1 }
+        }
+        .onChange(of: tracker.isSubmitting) { _, submitting in
+            if !submitting { editorFocusRequests += 1 }
+        }
+        .animation(.easeOut(duration: 0.2), value: store.searchVisible)
+        .animation(.easeOut(duration: 0.2), value: tracker.runningBlock?.id)
+        .animation(.easeOut(duration: 0.18), value: historyOpen)
+        .overlay(alignment: .bottom) {
+            Rectangle().fill(BlockStyle.rule).frame(height: 1)
+        }
+    }
+
     private var historyPalette: some View {
         VStack(spacing: 0) {
-            HStack {
-                Text("HISTORY")
-                    .font(.system(size: 10, weight: .semibold))
-                    .kerning(0.8)
-                    .foregroundStyle(BlockStyle.chipText)
-                Spacer()
-            }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 9)
-            .overlay(alignment: .top) {
-                if store.searchVisible {
-                    findBar
-                        .transition(.move(edge: .top).combined(with: .opacity))
-                }
-            }
-            // Closing the find bar, or a command finishing, hands the caret
-            // back to the editor — it is where typing goes, so it should never
-            // be left without focus.
-            .onChange(of: store.searchVisible) { _, visible in
-                if !visible { editorFocusRequests += 1 }
-            }
-            .onChange(of: tracker.runningBlock?.id) { _, running in
-                if running == nil { editorFocusRequests += 1 }
-            }
-            .onChange(of: tracker.isSubmitting) { _, submitting in
-                if !submitting { editorFocusRequests += 1 }
-            }
-            .animation(.easeOut(duration: 0.2), value: store.searchVisible)
-            .animation(.easeOut(duration: 0.2), value: tracker.runningBlock?.id)
-            .animation(.easeOut(duration: 0.18), value: historyOpen)
-            .overlay(alignment: .bottom) {
-                Rectangle().fill(BlockStyle.rule).frame(height: 1)
-            }
+            historyHeader
 
             VStack(spacing: 0) {
                 // Oldest at the top, so the most recent sits nearest the editor
