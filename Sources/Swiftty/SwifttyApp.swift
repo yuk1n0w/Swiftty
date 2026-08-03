@@ -238,6 +238,12 @@ final class AppPreferences: ObservableObject {
     @Published var selectedAgent: String {
         didSet { persist("selectedAgent", selectedAgent) }
     }
+    /// When on, the composer's ghost suggestion is predicted by the model from
+    /// what you have typed plus the directory and recent commands, falling back
+    /// to history/PATH. Off by default — it fires a small request as you type.
+    @Published var aiInlineSuggestions: Bool {
+        didSet { persist("aiInlineSuggestions", aiInlineSuggestions) }
+    }
     @Published private(set) var discoveredModels: [AIModel] = []
     @Published private(set) var modelsLoading = false
     @Published private(set) var modelError: String?
@@ -281,6 +287,7 @@ final class AppPreferences: ObservableObject {
         apiKey = KeychainStore.read(account: provider.keychainAccount)
         customInstructions = defaults.string(forKey: "customInstructions") ?? ""
         selectedAgent = defaults.string(forKey: "selectedAgent") ?? "Coder"
+        aiInlineSuggestions = defaults.object(forKey: "aiInlineSuggestions") as? Bool ?? false
     }
 
     var modelOptions: [AIModel] {
@@ -538,6 +545,97 @@ enum AIGateway {
         }
     }
 
+    /// A single, non-streaming shell-command completion for the composer's ghost
+    /// text. Deliberately minimal — a tiny prompt, a short reply, temperature 0 —
+    /// so it is cheap enough to fire as you type. Returns the model's best guess
+    /// at the full command line, or nil on any error (the caller falls back to
+    /// history/PATH).
+    static func suggestCommand(
+        provider: AIProvider,
+        model: String,
+        apiKey: String,
+        baseURL: String,
+        prefix: String,
+        context: String
+    ) async throws -> String? {
+        guard !provider.requiresAPIKey
+                || !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+
+        let system = "You are a shell command autocomplete inside a terminal. Given the "
+            + "context and a partial command line, reply with ONLY the single most likely "
+            + "complete command line and nothing else — no explanation, no markdown, no "
+            + "backticks. Your reply MUST begin with the exact partial text given."
+        let user = context.isEmpty
+            ? "Partial command:\n\(prefix)"
+            : context + "\n\nPartial command:\n\(prefix)"
+
+        if provider == .anthropic {
+            return try await suggestAnthropic(model: model, apiKey: apiKey, baseURL: baseURL, system: system, user: user)
+        }
+        return try await suggestOpenAI(model: model, apiKey: apiKey, baseURL: baseURL, system: system, user: user)
+    }
+
+    private static func suggestOpenAI(
+        model: String, apiKey: String, baseURL: String, system: String, user: String
+    ) async throws -> String? {
+        let endpoint = try endpointURL(baseURL, path: "chat/completions")
+        // No max_tokens: gpt-5/o-series reject it in favour of
+        // max_completion_tokens, and we only ever read the first line anyway.
+        func send(includeTemperature: Bool) async throws -> String? {
+            var request = URLRequest(url: endpoint)
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            if !apiKey.isEmpty { request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization") }
+            var payload: [String: Any] = [
+                "model": model,
+                "messages": [
+                    ["role": "system", "content": system],
+                    ["role": "user", "content": user],
+                ],
+                "stream": false,
+            ]
+            if includeTemperature { payload["temperature"] = 0 }
+            request.httpBody = try JSONSerialization.data(withJSONObject: payload)
+
+            let (data, response) = try await URLSession.shared.data(for: request)
+            try validate(response: response, data: data)
+            let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            let choices = root?["choices"] as? [[String: Any]]
+            let message = choices?.first?["message"] as? [String: Any]
+            return message?["content"] as? String
+        }
+        do { return try await send(includeTemperature: true) }
+        catch let AIGatewayError.server(message)
+            where message.localizedCaseInsensitiveContains("temperature") {
+            return try await send(includeTemperature: false)
+        }
+    }
+
+    private static func suggestAnthropic(
+        model: String, apiKey: String, baseURL: String, system: String, user: String
+    ) async throws -> String? {
+        let endpoint = try endpointURL(baseURL, path: "messages")
+        var request = URLRequest(url: endpoint)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+        request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+        let payload: [String: Any] = [
+            "model": model,
+            "max_tokens": 64,
+            "system": system,
+            "messages": [["role": "user", "content": user]],
+        ]
+        request.httpBody = try JSONSerialization.data(withJSONObject: payload)
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        try validate(response: response, data: data)
+        let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        let content = root?["content"] as? [[String: Any]]
+        return content?.first?["text"] as? String
+    }
+
     /// The JSON payload of a server-sent-event `data:` line, or nil for the
     /// blank lines and `event:` lines that separate events.
     private static func eventData(_ line: String) -> String? {
@@ -619,8 +717,11 @@ enum AIGateway {
             return "You are a helpful assistant inside Swiftty, a terminal. Be concise, practical, and honest."
         default: // Coder
             return "You are a coding assistant working inside Swiftty, a terminal. Help write, debug "
-                + "and run shell commands and code. Whenever you propose a command to run, put the exact "
-                + "command in its own fenced code block so it can be run directly. Be concise, practical, and honest."
+                + "and run shell commands and code. When a task needs commands, propose ONE command at a "
+                + "time in its own fenced code block; the user runs it and its output is sent back to you, "
+                + "so wait for that result before proposing the next step. Prefer safe, reversible commands "
+                + "and call out anything destructive first. Keep going until the task is done, then say so. "
+                + "Be concise, practical, and honest."
         }
     }
 
@@ -903,6 +1004,16 @@ struct SwifttyApp: App {
                 }
                 .keyboardShortcut(.downArrow, modifiers: .command)
 
+                Button("Jump to Next Failure") {
+                    store.stepFailureSelection(by: 1)
+                }
+                .keyboardShortcut("j", modifiers: .command)
+
+                Button("Jump to Previous Failure") {
+                    store.stepFailureSelection(by: -1)
+                }
+                .keyboardShortcut("j", modifiers: [.command, .shift])
+
                 Button("Copy Block Output") {
                     store.copySelectedBlockOutput()
                 }
@@ -945,6 +1056,10 @@ final class TerminalStore: ObservableObject {
     /// A command the AI panel wants dropped into the composer for review. The
     /// active tab's `BlockStack` picks it up, fills its input, and clears it.
     @Published var composerInjection: String?
+    /// The pane whose next finished command should be reported back to the
+    /// agent, armed when you Run an agent-proposed command and consumed the
+    /// moment that command finishes — the read-and-continue half of the loop.
+    private var agentRunPaneID: Pane.ID?
 
     /// Notifications raised when a command finishes in a tab the user was not
     /// watching, newest first.
@@ -1492,6 +1607,12 @@ final class TerminalStore: ObservableObject {
         activeBlockTracker?.moveSelection(by: offset)
     }
 
+    /// Jumps the selection to the next or previous failed block in the active
+    /// tab, wrapping — a fast way to walk a long scrollback's failures.
+    func stepFailureSelection(by offset: Int) {
+        activeBlockTracker?.selectAdjacentFailure(by: offset)
+    }
+
     /// Copies the selected block's output, falling back to the most recent
     /// finished block when nothing is selected.
     func copySelectedBlockOutput() {
@@ -1644,12 +1765,92 @@ final class TerminalStore: ObservableObject {
         Task { await sendAIMessage(message) }
     }
 
+    /// The most recent failed command in the active tab, if any — the target for
+    /// the AI panel's one-tap "fix the last error".
+    var lastFailedBlock: CommandBlock? {
+        activeBlockTracker?.blocks.last { $0.state.failed }
+    }
+
+    /// Runs the Fix flow against the most recent failure without needing a manual
+    /// block selection — pairs with the agentic loop for one-tap recovery.
+    func fixLastFailure() {
+        guard let tracker = activeBlockTracker,
+              let block = tracker.blocks.last(where: { $0.state.failed }) else { return }
+        askAI(about: block, tracker: tracker, mode: .fix)
+    }
+
     /// Fills the active tab's composer with a command for the user to review and
     /// run — the AI never runs anything itself.
     func insertIntoComposer(_ command: String) {
         let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         composerInjection = trimmed
+    }
+
+    /// A model-predicted completion of the composer draft, returned as the suffix
+    /// to show as ghost text — or nil to fall back to history/PATH. Off unless
+    /// the inline-suggestions preference is on.
+    func commandSuggestionSuffix(for draft: String, tracker: BlockTracker) async -> String? {
+        guard preferences.aiInlineSuggestions else { return nil }
+        let recent = tracker.commandHistory.prefix(8)
+            .map { "- \($0.command)" }
+            .joined(separator: "\n")
+        var context = "Working directory: \(tracker.currentDirectory)"
+        if let host = tracker.subshell { context += "\nRemote/subshell session: \(host)" }
+        if !recent.isEmpty { context += "\nRecent commands (most recent first):\n\(recent)" }
+
+        let full = try? await AIGateway.suggestCommand(
+            provider: preferences.selectedProvider,
+            model: preferences.selectedModel,
+            apiKey: preferences.apiKey,
+            baseURL: preferences.baseURL,
+            prefix: draft,
+            context: context
+        )
+        guard let full else { return nil }
+        // Keep only the first line, and only when it genuinely extends the draft.
+        let firstLine = full.split(separator: "\n", omittingEmptySubsequences: false)
+            .first.map(String.init) ?? full
+        let candidate = firstLine.trimmingCharacters(in: .whitespaces)
+        guard candidate.hasPrefix(draft), candidate.count > draft.count else { return nil }
+        return String(candidate.dropFirst(draft.count))
+    }
+
+    /// Runs a command the agent proposed, in the active pane, and arms a one-shot
+    /// so its result is fed back into the conversation for the agent to read and
+    /// continue. This is the "approve with one click" step of the agentic loop —
+    /// the agent still never runs anything on its own; a person presses Run.
+    func runFromAgent(_ command: String) {
+        let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !aiSending,
+              let paneID = activePaneID,
+              let tracker = activeBlockTracker else { return }
+        agentRunPaneID = paneID
+        tracker.submit(trimmed)
+    }
+
+    /// Feeds a just-finished agent-run command back into the conversation so the
+    /// agent reads the result and proposes the next step (or concludes).
+    private func reportCommandToAgent(_ block: CommandBlock, paneID: Pane.ID) {
+        let output = blockTrackers[paneID]?.plainOutput(for: block) ?? ""
+        aiPanelVisible = true
+        let message = Self.agentResultPrompt(block: block, output: output)
+        Task { await sendAIMessage(message) }
+    }
+
+    private static func agentResultPrompt(block: CommandBlock, output: String) -> AIMessage {
+        let exit = block.state.exitCode
+        let clipped = clip(output, maxLines: 120, maxChars: 6000)
+        let status = exit.map { $0 == 0 ? " → ok" : " → exit \($0)" } ?? ""
+        let label = "Ran `\(block.command)`" + status
+        var sent = "[Result of the command you proposed. Read the output, then either "
+            + "propose the next command in a single fenced code block, or explain the "
+            + "outcome plainly if the task is done. Do not repeat a command that just "
+            + "succeeded.]\n\n"
+        sent += "$ \(block.command)\n"
+        if let exit { sent += "(exit code \(exit))\n" }
+        sent += "\nOutput:\n```\n" + (clipped.isEmpty ? "(no output)" : clipped) + "\n```"
+        return AIMessage(role: .user, content: label, sent: sent)
     }
 
     private static func blockPrompt(block: CommandBlock, output: String, mode: BlockAIMode) -> AIMessage {
@@ -1756,6 +1957,15 @@ final class TerminalStore: ObservableObject {
     /// was in the background. A quick command in the tab you are staring at is
     /// never a notification.
     private func handleFinishedCommand(_ block: CommandBlock, paneID: Pane.ID) {
+        // The agentic loop's return leg: a command the agent proposed and you
+        // ran has finished, so hand its result back to the agent. Runs before
+        // the notify guards below — the agent wants the result whether the
+        // command was quick, slow, or failed.
+        if paneID == agentRunPaneID, !block.command.isEmpty {
+            agentRunPaneID = nil
+            reportCommandToAgent(block, paneID: paneID)
+        }
+
         guard !block.command.isEmpty else { return }
 
         let failed = (block.state.exitCode ?? 0) != 0
@@ -3811,6 +4021,20 @@ struct AIAgentPanel: View {
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
                         .frame(maxWidth: 240)
+                    if let failure = store.lastFailedBlock {
+                        Button {
+                            store.fixLastFailure()
+                        } label: {
+                            Label("Fix last error: \(failure.command)", systemImage: "wrench.and.screwdriver")
+                                .font(.system(size: 11, weight: .medium))
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                                .frame(maxWidth: 240)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(.orange)
+                        .padding(.top, 4)
+                    }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
@@ -3960,7 +4184,26 @@ struct AICodeBlock: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 10) {
+                // The one-click approve: run it in the terminal and let the agent
+                // read the result and continue. A person still presses this — the
+                // agent never runs anything on its own.
+                Button {
+                    store.runFromAgent(code)
+                } label: {
+                    Label("Run", systemImage: "play.fill")
+                        .font(.system(size: 10, weight: .semibold))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(Color.green.opacity(store.aiSending ? 0.08 : 0.20))
+                        .clipShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(store.aiSending ? Color.secondary : Color.green)
+                .disabled(store.aiSending)
+                .help("Run this in the terminal and let the agent read the result")
+
                 Spacer()
+
                 Button {
                     Pasteboard.copy(code)
                     copied = true
@@ -4359,6 +4602,15 @@ struct AgentsSettingsView: View {
                     .font(.system(size: 12))
                     .frame(minHeight: 150)
                 Text("These instructions are kept locally and sent with future agent requests.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("Inline suggestions") {
+                Toggle("Predict commands with AI as you type", isOn: $preferences.aiInlineSuggestions)
+                Text("Fills the command bar's ghost text with a model prediction from your "
+                    + "directory and recent commands, falling back to history. Fires a small "
+                    + "request as you type, so it is off by default.")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             }

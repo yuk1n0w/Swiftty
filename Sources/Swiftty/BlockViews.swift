@@ -289,6 +289,12 @@ struct BlockStack<Terminal: View>: View {
     @State private var historyOpen = false
     /// Bumped whenever the caret should return to the command editor.
     @State private var editorFocusRequests = 0
+    /// The model-predicted completion for the current draft, and the draft it was
+    /// computed for — shown as ghost text ahead of the history fallback while the
+    /// inline-suggestions preference is on. `suggestTask` debounces the request.
+    @State private var aiGhost = ""
+    @State private var aiGhostBase = ""
+    @State private var suggestTask: Task<Void, Never>?
 
     /// Blocks only make sense while the shell is at a prompt: there is nothing
     /// to show before the integration loads, and a full-screen program like vim
@@ -593,6 +599,7 @@ struct BlockStack<Terminal: View>: View {
                         onHeightChange: { editorHeight = $0 }
                     )
                     .frame(height: editorHeight)
+                    .onChange(of: draft) { _, value in scheduleAISuggestion(for: value) }
                 }
 
                 Spacer(minLength: 8)
@@ -742,7 +749,34 @@ struct BlockStack<Terminal: View>: View {
     /// it does not fight with what the arrow keys just inserted.
     private var suggestion: String {
         guard historyIndex == -1 else { return "" }
+        // A fresh AI prediction for exactly this draft wins; otherwise the
+        // instant history/PATH match carries the ghost.
+        if preferences.aiInlineSuggestions, aiGhostBase == draft, !aiGhost.isEmpty {
+            return aiGhost
+        }
         return tracker.suggestion(for: draft) ?? ""
+    }
+
+    /// Debounces a model-predicted completion for the draft, applying it as ghost
+    /// text only if it still matches what is typed when the answer lands.
+    private func scheduleAISuggestion(for text: String) {
+        suggestTask?.cancel()
+        // Drop a stale ghost at once so history takes back over as you type.
+        if aiGhostBase != text { aiGhost = "" }
+        let trimmed = text.trimmingCharacters(in: .whitespaces)
+        guard preferences.aiInlineSuggestions,
+              historyIndex == -1,
+              trimmed.count >= 3,
+              !trimmed.contains(where: { "|&;><$`\n".contains($0) }) else { return }
+        suggestTask = Task {
+            try? await Task.sleep(for: .milliseconds(400))
+            if Task.isCancelled { return }
+            let suffix = await store.commandSuggestionSuffix(for: text, tracker: tracker)
+            if Task.isCancelled { return }
+            guard draft == text, let suffix, !suffix.isEmpty else { return }
+            aiGhost = suffix
+            aiGhostBase = text
+        }
     }
 
     private func submit(_ command: String) {
@@ -1061,6 +1095,7 @@ private struct BlockView: View {
     @State private var isHovered = false
 
     private var isSelected: Bool { tracker.selectedBlockID == block.id }
+    private var isPinned: Bool { tracker.isPinned(block.id) }
 
     private var padding: CGFloat {
         BlockStyle.verticalPadding(compact: preferences.compactBlocks)
@@ -1126,8 +1161,26 @@ private struct BlockView: View {
                             store.askAI(about: block, tracker: tracker, mode: .fix)
                         }
                     }
+                    if !block.command.isEmpty {
+                        BlockIconButton(icon: "arrow.clockwise", help: "Run this command again") {
+                            tracker.rerun(block.command)
+                        }
+                    }
+                    BlockIconButton(
+                        icon: isPinned ? "pin.fill" : "pin",
+                        help: isPinned ? "Unpin — stop keeping this block" : "Pin — keep this block through Clear",
+                        tint: isPinned ? .orange : .secondary
+                    ) {
+                        tracker.togglePin(block.id)
+                    }
                     BlockMenuButton(block: block, tracker: tracker, store: store)
                 }
+            } else if isPinned {
+                // A quiet marker so pinned blocks read at a glance when not hovered.
+                Image(systemName: "pin.fill")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.orange.opacity(0.85))
+                    .help("Pinned — kept through Clear")
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -1222,6 +1275,28 @@ private struct BlockOutput: View {
 
 // MARK: - Actions
 
+/// A small circular icon button shown on a block on hover (rerun, pin).
+private struct BlockIconButton: View {
+    let icon: String
+    let help: String
+    var tint: SwiftUI.Color = .secondary
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.system(size: 11, weight: .semibold))
+                .frame(width: 24, height: 22)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(tint)
+        .background(SwiftUI.Color.white.opacity(0.08))
+        .clipShape(Circle())
+        .help(help)
+    }
+}
+
 private struct BlockMenuButton: View {
     let block: CommandBlock
     @ObservedObject var tracker: BlockTracker
@@ -1259,6 +1334,9 @@ private struct BlockMenu: View {
         }
         Divider()
         Button("Run Again") { tracker.rerun(block.command) }
+        Button(tracker.isPinned(block.id) ? "Unpin" : "Pin") {
+            tracker.togglePin(block.id)
+        }
         Divider()
         Button("Explain with AI") {
             store.askAI(about: block, tracker: tracker, mode: .explain)

@@ -151,6 +151,9 @@ final class BlockTracker: ObservableObject {
     @Published private(set) var runningVisible = false
     private var runningVisibleTask: Task<Void, Never>?
     @Published var selectedBlockID: CommandBlock.ID?
+    /// Blocks the user has pinned. Pinned blocks are kept through a Clear, a
+    /// `clear`/`cls`, and the scrollback trim — a deliberate "keep this around".
+    @Published private(set) var pinnedBlockIDs: Set<CommandBlock.ID> = []
     /// True once the shell has sent a marker, i.e. the integration is live.
     @Published private(set) var isIntegrationActive = false
     /// True while a full-screen program (vim, htop, less) owns the screen.
@@ -537,9 +540,49 @@ final class BlockTracker: ObservableObject {
         return blocks.first { $0.id == selectedBlockID }
     }
 
+    /// Moves the selection to the next or previous *failed* block, wrapping. With
+    /// nothing selected it jumps to the most recent failure, so a bare keypress
+    /// takes you straight to the last thing that went wrong.
+    func selectAdjacentFailure(by offset: Int) {
+        let failed = blocks.indices.filter { blocks[$0].state.failed }
+        guard !failed.isEmpty else { return }
+        guard let current = selectedBlockID.flatMap({ id in
+            blocks.firstIndex { $0.id == id }
+        }) else {
+            selectedBlockID = blocks[failed.last!].id
+            return
+        }
+        let target: Int
+        if offset > 0 {
+            target = failed.first { $0 > current } ?? failed.first!
+        } else {
+            target = failed.last { $0 < current } ?? failed.last!
+        }
+        selectedBlockID = blocks[target].id
+    }
+
+    func isPinned(_ id: CommandBlock.ID) -> Bool { pinnedBlockIDs.contains(id) }
+
+    func togglePin(_ id: CommandBlock.ID) {
+        if pinnedBlockIDs.contains(id) {
+            pinnedBlockIDs.remove(id)
+        } else {
+            pinnedBlockIDs.insert(id)
+        }
+    }
+
     func clearHistory() {
-        blocks.removeAll()
-        selectedBlockID = nil
+        clearUnpinned()
+    }
+
+    /// Removes every block except the pinned ones, and forgets a selection that
+    /// went with them. Shared by Clear Blocks and the `clear`/`cls` command.
+    private func clearUnpinned() {
+        blocks.removeAll { !pinnedBlockIDs.contains($0.id) }
+        pinnedBlockIDs.formIntersection(blocks.map(\.id))
+        if let selectedBlockID, !blocks.contains(where: { $0.id == selectedBlockID }) {
+            self.selectedBlockID = nil
+        }
     }
 
     /// Resets the terminal emulator to a clean slate — the cure for a screen left
@@ -896,8 +939,7 @@ final class BlockTracker: ObservableObject {
         // the terminal buffer it wipes only ever holds the command in progress.
         // What the user means is "wipe the history", so that is what it does.
         if Self.clearsHistory(block.command) {
-            blocks.removeAll()
-            selectedBlockID = nil
+            clearUnpinned()
             outputStartRow = nil
             return
         }
@@ -938,12 +980,19 @@ final class BlockTracker: ObservableObject {
     private func append(_ block: CommandBlock) {
         blocks.append(block)
         guard blocks.count > maximumBlocks else { return }
-        let excess = blocks.count - maximumBlocks
-        if let selectedBlockID,
-           blocks.prefix(excess).contains(where: { $0.id == selectedBlockID }) {
-            self.selectedBlockID = nil
+        // Trim from the front, but step over pinned blocks — the user asked to
+        // keep those, so they don't count against the scrollback budget.
+        var excess = blocks.count - maximumBlocks
+        var index = 0
+        while excess > 0, index < blocks.count {
+            if pinnedBlockIDs.contains(blocks[index].id) {
+                index += 1
+                continue
+            }
+            if blocks[index].id == selectedBlockID { selectedBlockID = nil }
+            blocks.remove(at: index)
+            excess -= 1
         }
-        blocks.removeFirst(excess)
     }
 
     // MARK: - Git
